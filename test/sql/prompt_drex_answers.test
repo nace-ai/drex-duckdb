@@ -48,7 +48,7 @@ drex-max	drex-max	1	noul
 # Checked before any reset, since a cached list sends no second request
 query II
 SELECT count(*) > 0, bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000'
-                              AND user_agent LIKE 'duckdb-drex/%' AND status = 200)
+                              AND user_agent LIKE 'drex-duckdb/%' AND status = 200)
 FROM drex_requests('answers') WHERE endpoint = '/v1/models';
 ----
 true	true
@@ -323,7 +323,7 @@ drex-latest
 # Attribution in User-Agent and X-Nace-Client, the key as a bearer token, JSON, an Idempotency-Key, and a model and
 # instructions string on every question
 query IIIIIIII
-SELECT bool_and(user_agent LIKE 'duckdb-drex/%'), bool_and(x_nace_client = user_agent),
+SELECT bool_and(user_agent LIKE 'drex-duckdb/%'), bool_and(x_nace_client = user_agent),
        bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000'),
        bool_and(content_type LIKE 'application/json%'), bool_and(coalesce(idempotency_key, '') <> ''),
        bool_and(model_present), bool_and(instructions_present), bool_and(status = 200)

@@ -117,7 +117,7 @@ int main() {
 			CHECK(r.json.find("\"noul\":0.9868") != string::npos);
 		}
 		CHECK(Log(con, "t_ok", "count(*)") == Value::BIGINT(3));
-		CHECK(Log(con, "t_ok", "bool_and(user_agent LIKE 'duckdb-drex/%' AND x_nace_client = user_agent)") ==
+		CHECK(Log(con, "t_ok", "bool_and(user_agent LIKE 'drex-duckdb/%' AND x_nace_client = user_agent)") ==
 		      Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "bool_and(authorization_header = 'Bearer " + KEY + "')") == Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "bool_and(content_type = 'application/json')") == Value::BOOLEAN(true));

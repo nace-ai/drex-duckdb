@@ -49,14 +49,14 @@ static constexpr const char *OPENROUTER_REFERER = "https://github.com/nace-ai/dr
 static constexpr const char *OPENROUTER_TITLE = "Drex for DuckDB";
 static constexpr const char *OPENROUTER_BILLING_URL = "https://openrouter.ai/settings/credits";
 
-//! duckdb-drex/<version>, sent as User-Agent and X-Nace-Client
+//! drex-duckdb/<version>, sent as User-Agent and X-Nace-Client
 static string ClientName() {
 #ifdef EXT_VERSION_DREX
 	string version = EXT_VERSION_DREX;
 #else
 	string version;
 #endif
-	return "duckdb-drex/" + (version.empty() ? string("dev") : version);
+	return "drex-duckdb/" + (version.empty() ? string("dev") : version);
 }
 
 //! Whether the base URL is OpenRouter's (https://openrouter.ai/api), which takes a different body and headers
