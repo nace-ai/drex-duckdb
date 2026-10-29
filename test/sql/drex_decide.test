@@ -65,7 +65,7 @@ NULL
 
 # Same headers as prompt_drex
 query IIII
-SELECT bool_and(user_agent LIKE 'duckdb-drex/%'), bool_and(x_nace_client = user_agent),
+SELECT bool_and(user_agent LIKE 'drex-duckdb/%'), bool_and(x_nace_client = user_agent),
        bool_and(coalesce(idempotency_key, '') <> ''),
        bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000')
 FROM drex_requests('decide') WHERE endpoint = '/v1/systemone';

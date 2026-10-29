@@ -470,7 +470,7 @@ class MockTest(unittest.TestCase):
     # -- the request log ------------------------------------------------------------------------------------------
 
     def test_log_records_headers_and_instructions(self):
-        headers = {"User-Agent": "duckdb-drex/0.0.1", "X-Nace-Client": "duckdb-drex/0.0.1", "Idempotency-Key": "k1"}
+        headers = {"User-Agent": "drex-duckdb/0.0.1", "X-Nace-Client": "drex-duckdb/0.0.1", "Idempotency-Key": "k1"}
         self.api("ok", "/v1/systemone", SUPPORT_TICKET, headers=headers)
         no_instructions = {"state": {"a": 1}, "questions": {"a": {"type": "noul", "criteria": {"true": "y"}}}}
         self.api("ok", "/v1/systemone", no_instructions)
@@ -478,7 +478,7 @@ class MockTest(unittest.TestCase):
         self.assertEqual(first["authorization_header"], f"Bearer {KEY}")
         self.assertEqual(
             (first["user_agent"], first["x_nace_client"], first["idempotency_key"]),
-            ("duckdb-drex/0.0.1", "duckdb-drex/0.0.1", "k1"),
+            ("drex-duckdb/0.0.1", "drex-duckdb/0.0.1", "k1"),
         )
         self.assertEqual(first["content_type"], "application/json")
         self.assertEqual(
