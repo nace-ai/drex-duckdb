@@ -1,0 +1,247 @@
+# name: test/sql/semantics_statements.test
+# description: how many requests CTEs, EXPLAIN, prepared statements, views and DML send, each a billed request
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/semantics_statements/ok');
+
+statement ok
+SET drex_max_rpm = 0;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, 'row ' || range AS txt FROM range(100);
+
+statement ok
+CREATE MACRO sent(endpoint_name) AS (
+    SELECT count(*) FROM drex_requests('semantics_statements') WHERE endpoint = endpoint_name);
+
+# --- CTEs ------------------------------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+# Referenced twice: materialized by default, so each row is sent once
+query I
+WITH c AS (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t) SELECT count(*) FROM c a JOIN c b USING (id, p);
+----
+100
+
+query I
+SELECT sent('/v1/systemone');
+----
+100
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+query I
+WITH c AS MATERIALIZED (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t)
+SELECT count(*) FROM c a JOIN c b USING (id, p);
+----
+100
+
+query I
+SELECT sent('/v1/systemone');
+----
+100
+
+# NOT MATERIALIZED: inlined at each reference, so each row is sent twice
+statement ok
+FROM drex_reset('semantics_statements');
+
+query I
+WITH c AS NOT MATERIALIZED (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t)
+SELECT count(*) FROM c a JOIN c b USING (id, p);
+----
+100
+
+query I
+SELECT sent('/v1/systemone');
+----
+200
+
+# A materialized CTE is computed whole, whatever reads it
+statement ok
+FROM drex_reset('semantics_statements');
+
+query I
+WITH c AS MATERIALIZED (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t) SELECT count(p) FROM (FROM c LIMIT 5);
+----
+5
+
+query I
+SELECT sent('/v1/systemone');
+----
+100
+
+# --- a result nothing reads is never computed ------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+query I
+SELECT count(*) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t);
+----
+100
+
+query I
+WITH c AS MATERIALIZED (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t) SELECT count(*) FROM c;
+----
+100
+
+query I
+SELECT sent('/v1/systemone');
+----
+0
+
+# --- the same call twice is two requests -----------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+query I
+SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t WHERE id < 10 AND prompt_drex(txt, 'Refund?') > 0.5);
+----
+10
+
+query I
+SELECT sent('/v1/systemone');
+----
+20
+
+# The two requests for a row have the same body, so the same Idempotency-Key
+query II
+SELECT count(DISTINCT idempotency_key), count(DISTINCT body_sha256) FROM drex_requests('semantics_statements')
+WHERE endpoint = '/v1/systemone';
+----
+10	10
+
+# DuckDB's array_to_string is a macro that names its argument twice; in a subquery the call is made once
+statement ok
+FROM drex_reset('semantics_statements');
+
+statement ok
+SELECT array_to_string(prompt_drex(txt, 'Which?', choice := ['a', 'b']).probabilities::VARCHAR[], ' | ')
+FROM t WHERE id < 10;
+
+query I
+SELECT sent('/v1/systemone');
+----
+20
+
+statement ok
+SELECT array_to_string(c.probabilities::VARCHAR[], ' | '), c.choice
+FROM (SELECT prompt_drex(txt, 'Which?', choice := ['a', 'b']) AS c FROM t WHERE id < 10);
+
+query I
+SELECT sent('/v1/systemone');
+----
+30
+
+# --- EXPLAIN and EXPLAIN ANALYZE -------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+# EXPLAIN binds, which may read GET /v1/models (once per base URL for the database), and sends no question
+statement ok
+EXPLAIN SELECT prompt_drex(txt, 'Refund?') FROM t;
+
+query I
+SELECT sent('/v1/systemone');
+----
+0
+
+statement ok
+EXPLAIN ANALYZE SELECT prompt_drex(txt, 'Refund?') FROM t WHERE id < 7;
+
+query I
+SELECT sent('/v1/systemone');
+----
+7
+
+# --- prepared statements bind once and send on each EXECUTE ----------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+statement ok
+PREPARE below AS SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t WHERE id < $1);
+
+query I
+SELECT sent('/v1/systemone');
+----
+0
+
+query I
+EXECUTE below(3);
+----
+3
+
+query I
+EXECUTE below(4);
+----
+4
+
+query I
+SELECT sent('/v1/systemone');
+----
+7
+
+# --- views send on each read -----------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+statement ok
+CREATE VIEW v AS SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t;
+
+query I
+SELECT count(p) FROM v WHERE id < 4;
+----
+4
+
+query I
+SELECT count(p) FROM v WHERE id < 4;
+----
+4
+
+query I
+SELECT sent('/v1/systemone');
+----
+8
+
+# --- CREATE TABLE AS, INSERT ... SELECT and UPDATE send once per row written, and reads send nothing ----------------
+
+statement ok
+FROM drex_reset('semantics_statements');
+
+statement ok
+CREATE TABLE r AS SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t WHERE id < 20;
+
+statement ok
+INSERT INTO r SELECT id, prompt_drex(txt, 'Refund?') FROM t WHERE id BETWEEN 20 AND 34;
+
+query I
+SELECT sent('/v1/systemone');
+----
+35
+
+statement ok
+ALTER TABLE t ADD COLUMN p DOUBLE;
+
+statement ok
+UPDATE t SET p = prompt_drex(txt, 'Refund?') WHERE id < 12;
+
+query II
+SELECT count(p), sent('/v1/systemone') FROM t;
+----
+12	47
+
+query II
+SELECT count(p), sent('/v1/systemone') FROM r;
+----
+35	47

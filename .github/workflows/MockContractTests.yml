@@ -1,0 +1,59 @@
+#
+# Runs the SQLLogicTests that need the mock Drex API (test/mock/drex_mock.py). The distribution pipeline runs its tests
+# inside Docker, where the mock is not reachable, so those tests skip there (require-env DREX_MOCK_URL) and run here.
+#
+name: Mock Contract Tests
+on:
+  # A pull request runs on its pull_request event alone, not again for the push
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  mock-contract-tests:
+    name: SQLLogicTests against the mock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check the mock
+        # jsonschema validates every response against Drex's schemas in test/mock/openapi.json
+        run: |
+          python3 -m pip install --quiet jsonschema
+          python3 -m unittest discover -s test/mock -v
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev libcurl4-openssl-dev
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: mock-contract-tests-${{ runner.os }}
+
+      - name: Build
+        env:
+          GEN: ninja
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: make release
+
+      - name: Run the SQLLogicTests with the mock
+        run: |
+          python3 test/mock/drex_mock.py --port 0 --url-file "$RUNNER_TEMP/drex-mock-url" &
+          for _ in $(seq 50); do [ -s "$RUNNER_TEMP/drex-mock-url" ] && break; sleep 0.1; done
+          export DREX_MOCK_URL="$(cat "$RUNNER_TEMP/drex-mock-url")"
+          curl --fail --silent "$DREX_MOCK_URL/__health"
+          # For test/sql/prompt_drex_secret_env.test: a well-formed test key, never a real one
+          export NACE_API_KEY="nace_sk_mockKeyForDrexContractTests_222222222222222"
+          export NACE_BASE_URL="$DREX_MOCK_URL/ns/secret_env/ok"
+          make test

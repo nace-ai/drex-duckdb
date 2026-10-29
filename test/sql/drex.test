@@ -1,0 +1,102 @@
+# name: test/sql/drex.test
+# description: the drex extension registers the nace secret, prompt_drex and drex_decide
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT drex_decide('"text"', '{}');
+----
+Catalog Error: Scalar Function with name drex_decide does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require drex
+
+# The config provider keeps the key out of duckdb_secrets() and normalizes the base URL
+statement ok
+CREATE SECRET nace_config (TYPE nace, API_KEY 'nace_sk_test_value', BASE_URL 'http://localhost:8080/');
+
+query III
+SELECT provider, secret_string LIKE '%api_key=redacted%' AND secret_string NOT LIKE '%nace_sk_test_value%',
+       secret_string LIKE '%base_url=http://localhost:8080'
+FROM duckdb_secrets() WHERE name = 'nace_config';
+----
+config	true	true
+
+statement ok
+CREATE SECRET nace_default (TYPE nace, API_KEY 'nace_sk_test_value');
+
+query I
+SELECT secret_string LIKE '%base_url=https://console.nace.ai' FROM duckdb_secrets() WHERE name = 'nace_default';
+----
+true
+
+statement error
+CREATE SECRET (TYPE nace);
+----
+the config provider requires API_KEY
+
+statement error
+CREATE SECRET (TYPE nace, API_KEY 'nace_sk_test_value', BASE_URL 'console.nace.ai');
+----
+base_url must start with https:// or http://
+
+# http:// would send the key in the clear, so it is taken only for this machine, its host compared whole
+foreach url http://console.nace.ai http://localhost.evil.com http://127.0.0.1@evil.com http://evil.com/127.0.0.1 http://evil.com?@localhost http://[::1].evil.com
+
+statement error
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_test_value', BASE_URL '{url}');
+----
+nace secret: base_url must use https:// outside localhost, got 'http://
+
+endloop
+
+foreach url http://127.0.0.1:8787 http://localhost:1/x http://[::1]:8787 http://LOCALHOST http://evil.com@127.0.0.1 https://console.nace.ai
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_test_value', BASE_URL '{url}');
+
+query T
+SELECT secret_string LIKE '%;base_url={url}' FROM duckdb_secrets() WHERE name = 'drex';
+----
+true
+
+endloop
+
+statement ok
+DROP SECRET drex;
+
+statement error
+CREATE SECRET (TYPE nace, API_KEY 'nace_sk_test_value', SCOPE 'https://console.nace.ai');
+----
+SCOPE is not supported
+
+statement error
+CREATE SECRET (TYPE nace, PROVIDER env, API_KEY 'nace_sk_test_value');
+----
+Unknown parameter "api_key" for secret type "nace" with provider "env"
+
+# Named arguments are checked by name and type before the bind callback runs
+statement error
+SELECT prompt_drex('text', 'Is it?', noul := ['true', 'false'], model := 'drex-v2.0', concurrency := 4);
+----
+<REGEX>:.*prompt_drex: .*
+
+statement error
+SELECT prompt_drex('text', 'Is it?', bogus := 'yes');
+----
+No function matches the given name and argument types
+
+statement error
+SELECT prompt_drex('text', 'Is it?', concurrency := -1);
+----
+No function matches the given name and argument types
+
+statement error
+SELECT drex_decide('"text"', '{}', model := 'drex-max');
+----
+<REGEX>:.*drex_decide: .*
+
+statement error
+SELECT drex_decide('"text"', '{}', modle := 'drex-max');
+----
+No function matches the given name and argument types

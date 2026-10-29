@@ -1,0 +1,112 @@
+# name: test/sql/concurrency_cap.test
+# description: the in-flight cap holds across DuckDB threads, connections and calls, and a retry holds no slot
+# group: [sql]
+
+# The mock's slow-100 scenario holds each answer 100 ms, so a call's requests overlap; in_flight is how many of the
+# namespace's requests the mock was answering when each arrived, so its max is the peak
+
+include test/mock/requests.test_template
+
+statement ok
+SET drex_max_rpm = 0;
+
+statement ok
+SET drex_max_concurrency = 4;
+
+statement ok
+CREATE TABLE tickets AS SELECT i FROM range(8) t(i);
+
+# Four calls at once: each UNION ALL branch is its own pipeline, and with no cap they reach 32 in flight together
+
+foreach threads 1 4 32
+
+statement ok
+FROM drex_reset('concurrency_cap_{threads}');
+
+statement ok
+SET threads = {threads};
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_cap_{threads}/slow-100');
+
+query I
+SELECT count(answer) FROM (
+    SELECT prompt_drex('A' || i, 'Refund?') AS answer FROM tickets
+    UNION ALL SELECT prompt_drex('B' || i, 'Refund?') FROM tickets
+    UNION ALL SELECT prompt_drex('C' || i, 'Refund?') FROM tickets
+    UNION ALL SELECT prompt_drex('D' || i, 'Refund?') FROM tickets);
+----
+32
+
+query II
+SELECT count(*), max(in_flight) FROM drex_requests('concurrency_cap_{threads}') WHERE endpoint = '/v1/systemone';
+----
+32	4
+
+endloop
+
+# concurrency := caps the call below the setting
+
+statement ok
+FROM drex_reset('concurrency_cap_call');
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_cap_call/slow-100');
+
+query I
+SELECT count(answer) FROM (
+    SELECT prompt_drex('A' || i, 'Refund?', concurrency := 2) AS answer FROM tickets
+    UNION ALL SELECT prompt_drex('B' || i, 'Refund?', concurrency := 2) FROM tickets);
+----
+16
+
+query II
+SELECT count(*), max(in_flight) FROM drex_requests('concurrency_cap_call') WHERE endpoint = '/v1/systemone';
+----
+16	2
+
+# Four connections at once share the database's one limiter
+
+statement ok
+FROM drex_reset('concurrency_cap_connections');
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_cap_connections/slow-100');
+
+concurrentloop c 0 4
+
+query I
+SELECT count(prompt_drex('Connection {c}, ticket ' || i, 'Refund?')) FROM range(8) t(i);
+----
+8
+
+endloop
+
+query II
+SELECT count(*), max(in_flight) FROM drex_requests('concurrency_cap_connections') WHERE endpoint = '/v1/systemone';
+----
+32	4
+
+# A row waiting to retry holds no slot: with one slot, each row's first attempt is sent while the rows refused
+# before it wait out their retry-after-ms
+
+statement ok
+FROM drex_reset('concurrency_cap_retry');
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_cap_retry/429-once');
+
+query I
+SELECT count(prompt_drex('Ticket ' || i, 'Refund?', concurrency := 1)) FROM range(3) t(i);
+----
+3
+
+query TI
+SELECT list(attempt ORDER BY seq), max(in_flight) FROM drex_requests('concurrency_cap_retry')
+WHERE endpoint = '/v1/systemone';
+----
+[1, 1, 1, 2, 2, 2]	1

@@ -1,0 +1,150 @@
+# name: test/sql/edge_criteria.test
+# description: unusual labels are sent and read back exactly, and the label and question counts hold at their limits
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('edge_criteria');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_criteria/ok');
+
+# --- labels with quotes, backslashes, Unicode and leading or trailing spaces ------------------------------------------
+
+# Drex takes any label as a key, untrimmed, so ' padded ' and 'padded' are two labels. The mock picks the first, with
+# weights 6, 5, ..., 1; the probabilities come back sorted by label, byte by byte
+query TT
+SELECT r.choice, array_to_string([p.value || '=' || p.probability FOR p IN r.probabilities], ' | ')
+FROM (SELECT prompt_drex('text', 'Which?',
+    choice := ['say "hi"', 'back\slash', 'it''s', 'ünï 😀', ' padded ', 'padded']) AS r);
+----
+say "hi"	 padded =0.0952 | back\slash=0.2381 | it's=0.1905 | padded=0.0476 | say "hi"=0.2857 | ünï 😀=0.1429
+
+# Sent as written, in order
+query T
+SELECT json_keys(questions->'$[0].criteria') = ['say "hi"', 'back\slash', 'it''s', 'ünï 😀', ' padded ', 'padded']
+FROM drex_requests('edge_criteria') WHERE endpoint = '/v1/systemone';
+----
+true
+
+statement ok
+FROM drex_reset('edge_criteria');
+
+# The same in descriptions, and in score levels, which keep their order and index. In a subquery, since DuckDB's
+# array_to_string macro evaluates its argument twice, which would send the request twice
+query TT
+SELECT c.choice, array_to_string([p.index || p.value FOR p IN s.probabilities], ' | ')
+FROM (SELECT prompt_drex('text', 'Which?', choice := [
+                 {'label': ' a', 'description': 'q"\' || chr(10) || 'ü 😀'},
+                 {'label': 'a ', 'description': ' '},
+                 {'label': 'A', 'description': NULL}]) AS c,
+             prompt_drex('text', 'How?', score := [' low', 'mid"', 'high\', '😀']) AS s);
+----
+ a	0 low | 1mid" | 2high\ | 3😀
+
+query T
+SELECT array_to_string(list((questions->'$[0].criteria')::VARCHAR ORDER BY seq), ' | ') FROM drex_requests('edge_criteria')
+WHERE endpoint = '/v1/systemone';
+----
+{" a":"q\"\\\nü 😀","a ":" ","A":null} | [" low","mid\"","high\\","😀"]
+
+# noul's descriptions too, whose labels must be exactly true and false
+query R
+SELECT prompt_drex('text', noul := [{'label': 'true', 'description': ' "yes" \ '}, {'label': 'false', 'description': 'ñ'}]);
+----
+0.75
+
+statement error
+SELECT prompt_drex('text', 'Refund?', noul := [' true', 'false']);
+----
+<REGEX>:.*prompt_drex: noul labels must be exactly true and false, got \[ true, false\].*
+
+statement error
+SELECT prompt_drex('text', 'Refund?', noul := ['True', 'False']);
+----
+<REGEX>:.*prompt_drex: noul labels must be exactly true and false, got \[True, False\].*
+
+# --- 255 labels or levels pass, and 256 are refused at bind ------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_criteria');
+
+query TTTT
+SELECT prompt_drex('text', 'Which?', choice := ['l' || x FOR x IN range(255)]).choice,
+       len(prompt_drex('text', 'How?', score := ['l' || x FOR x IN range(255)]).probabilities),
+       prompt_drex('text', 'Which?', choice := [{'label': 'l' || x, 'description': 'd'} FOR x IN range(255)],
+                   model := 'drex-max').choice,
+       len(prompt_drex('text', 'How?', score := ['l' || x FOR x IN range(255)], model := 'drex-max').probabilities);
+----
+l0	255	l0	255
+
+query II
+SELECT count(*), bool_and(status = 200) FROM drex_requests('edge_criteria') WHERE endpoint = '/v1/systemone';
+----
+4	true
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := ['l' || x FOR x IN range(256)]);
+----
+<REGEX>:.*prompt_drex: choice takes 2 to 255 labels, got 256.*
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := [{'label': 'l' || x, 'description': NULL} FOR x IN range(256)]);
+----
+<REGEX>:.*prompt_drex: choice takes 2 to 255 labels, got 256.*
+
+statement error
+SELECT prompt_drex('text', 'How?', score := ['l' || x FOR x IN range(256)], model := 'drex-max');
+----
+<REGEX>:.*prompt_drex: score takes 2 to 255 levels, got 256.*
+
+statement error
+SELECT prompt_drex('text', questions := ('{"q": {"type": "choice", "instructions": "Which?", "criteria": {'
+    || array_to_string(['"l' || x || '": null' FOR x IN range(256)], ', ') || '}}}')::JSON);
+----
+<REGEX>:.*prompt_drex: questions\.q takes 2 to 255 labels, got 256.*
+
+# --- 512 questions pass on every model, and 513 are refused at bind ----------------------------------------------------
+
+# Drex Max supports more than 16 questions; verify that 17 pass as well
+statement ok
+CREATE MACRO noul_questions(n) AS
+    ('{' || array_to_string(['"q' || x || '": {"type": "noul", "instructions": "Question ' || x || '?"}'
+                             FOR x IN range(1, n + 1)], ', ') || '}')::JSON;
+
+statement ok
+FROM drex_reset('edge_criteria');
+
+query RRRR
+SELECT prompt_drex('text', questions := noul_questions(512)).q512,
+       prompt_drex('text', questions := noul_questions(16), model := 'drex-max').q16,
+       prompt_drex('text', questions := noul_questions(17), model := 'drex-max').q17,
+       prompt_drex('text', questions := noul_questions(512), model := 'drex-max').q512;
+----
+0.75	0.75	0.75	0.75
+
+query TII
+SELECT model, question_count, status FROM drex_requests('edge_criteria') WHERE endpoint = '/v1/systemone'
+ORDER BY question_count, model;
+----
+drex-max	16	200
+drex-max	17	200
+drex-max	512	200
+drex-v2.0	512	200
+
+statement error
+SELECT prompt_drex('text', questions := noul_questions(513));
+----
+<REGEX>:.*prompt_drex: questions takes 1 to 512 questions, got 513.*
+
+statement error
+SELECT prompt_drex('text', questions := noul_questions(513), model := 'drex-max');
+----
+<REGEX>:.*prompt_drex: questions takes 1 to 512 questions, got 513.*
+
+query I
+SELECT count(*) FROM drex_requests('edge_criteria') WHERE endpoint = '/v1/systemone';
+----
+4

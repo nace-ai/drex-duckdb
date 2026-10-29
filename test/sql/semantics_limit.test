@@ -1,0 +1,131 @@
+# name: test/sql/semantics_limit.test
+# description: how many rows LIMIT, OFFSET, ORDER BY and filters send to Drex, each a billed request
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/semantics_limit/ok');
+
+statement ok
+SET drex_max_rpm = 0;
+
+# One thread, so that a filter on prompt_drex sends one chunk; more threads each send their own
+statement ok
+SET threads = 1;
+
+# 2,100 rows: one full 2,048-row chunk and part of a second
+statement ok
+CREATE TABLE t AS SELECT range AS id, 'row ' || range AS txt FROM range(2100);
+
+statement ok
+CREATE MACRO sent() AS (SELECT count(*) FROM drex_requests('semantics_limit') WHERE endpoint = '/v1/systemone');
+
+# --- LIMIT alone sends only the rows it returns ----------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t LIMIT 5);
+----
+5
+
+query I
+SELECT sent();
+----
+5
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t LIMIT 2049);
+----
+2049
+
+query I
+SELECT sent();
+----
+2049
+
+# --- OFFSET sends every row of each chunk it reads -------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t LIMIT 5 OFFSET 10);
+----
+5
+
+query I
+SELECT sent();
+----
+2048
+
+# --- ORDER BY ... LIMIT sends every row ------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(p) FROM (SELECT id, prompt_drex(txt, 'Refund?') AS p FROM t ORDER BY id LIMIT 5);
+----
+5
+
+query I
+SELECT sent();
+----
+2100
+
+# --- a filter on the input sends only the rows it keeps --------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(p) FROM (SELECT prompt_drex(txt, 'Refund?') AS p FROM t WHERE id < 10);
+----
+10
+
+# DuckDB runs the cheap condition first, whichever side of AND it is on
+query I
+SELECT count(*) FROM t WHERE prompt_drex(txt, 'Refund?') > 0.5 AND id < 10;
+----
+10
+
+query I
+SELECT sent();
+----
+20
+
+# --- a filter on prompt_drex sends every row it reads ----------------------------------------------------------------
+
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(*) FROM t WHERE prompt_drex(txt, 'Refund?') > 0.5;
+----
+2100
+
+query I
+SELECT sent();
+----
+2100
+
+# With LIMIT, every row of the chunk that holds the first five
+statement ok
+FROM drex_reset('semantics_limit');
+
+query I
+SELECT count(*) FROM (SELECT id FROM t WHERE prompt_drex(txt, 'Refund?') > 0.5 LIMIT 5);
+----
+5
+
+query I
+SELECT sent();
+----
+2048

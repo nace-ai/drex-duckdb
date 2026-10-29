@@ -1,0 +1,29 @@
+# name: test/sql/concurrency_rpm_default.test
+# description: drex_max_rpm defaults to 0, so a burst is not paced on the client; Drex's 429s pace the account
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('concurrency_rpm_default');
+
+query I
+SELECT current_setting('drex_max_rpm');
+----
+0
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_rpm_default/ok');
+
+query I
+SELECT count(prompt_drex('Ticket ' || i, 'Refund?')) FROM range(80) t(i);
+----
+80
+
+# At 120 a minute, a bucket of 10 that refills at 2 a second, the 81 requests (the bind's GET /v1/models included)
+# would take 35 seconds
+query II
+SELECT count(*), max(received_at) - min(received_at) < 3 FROM drex_requests('concurrency_rpm_default');
+----
+81	true

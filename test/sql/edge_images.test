@@ -1,0 +1,132 @@
+# name: test/sql/edge_images.test
+# description: what prompt_drex sends for unusual images, how many it takes, and the 4 MiB body limit to the byte
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('edge_images');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_images/ok');
+
+# A 2 x 2 animated PNG of two frames, red then blue, and a 1 x 1 GIF
+statement ok
+CREATE TABLE img AS SELECT
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/red.png')) AS red,
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/blue.png')) AS blue,
+    unhex('89504E470D0A1A0A0000000D4948445200000002000000020802000000FDD49A73000000086163544C0000000200000000F38D93'
+          '700000001A6663544C0000000000000002000000020000000000000000000100010000E40133E1000000104944415478DA63B823'
+          '2707440C100A0021A60461A71BD3860000001A6663544C00000001000000020000000200000000000000000001000100007F72D9'
+          '3500000014666441540000000278DA6390B3B903440C100A001EFE04D9CD7C91EB0000000049454E44AE426082') AS apng,
+    unhex('4749463839610100010080000000FF00000000002C00000000010001000002024401003B') AS gif;
+
+statement ok
+CALL enable_logging(level = 'warning', storage = 'memory');
+
+# --- images the client refuses: never sent, the row is NULL with a warning -------------------------------------------
+
+# A 0-byte BLOB and a GIF are not a PNG, JPEG or WebP, which are all Drex reads
+query IT
+SELECT n, prompt_drex(image, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM (SELECT 1, ''::BLOB UNION ALL SELECT 2, gif FROM img UNION ALL SELECT 3, red FROM img) t(n, image)
+ORDER BY n;
+----
+1	NULL
+2	NULL
+3	red
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message = 'prompt_drex: a row returned NULL: image 1 is not a PNG, JPEG or WebP image';
+----
+2
+
+# --- images the client sends as PNGs ---------------------------------------------------------------------------------
+
+# A PNG cut after its header passes the magic-byte check, and Drex takes any base64, so it is sent; what Drex's model
+# server makes of it is for the live tests. An animated PNG is a PNG: the mock reads its first frame, as a reader of
+# plain PNGs would
+query TT
+SELECT prompt_drex(red[1:33], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice,
+       prompt_drex(apng, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM img;
+----
+red	red
+
+query IIT
+SELECT status, image_count, image_colours FROM drex_requests('edge_images') WHERE endpoint = '/v1/systemone'
+ORDER BY seq;
+----
+200	1	[red]
+200	1	[unknown]
+200	1	[red]
+
+# --- how many images ------------------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_images');
+
+# Drex takes 8. The client leaves the count to Drex, whose 422 is about the row's images, so a ninth loses that row only
+query IT
+SELECT n, prompt_drex(images, 'What colour is Image 8?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM (SELECT 8, list_concat(list_resize([red], 7, red), [blue]) FROM img
+      UNION ALL SELECT 9, list_concat(list_resize([red], 7, red), [blue, blue]) FROM img) t(n, images)
+ORDER BY n;
+----
+8	blue
+9	NULL
+
+query II
+SELECT image_count, status FROM drex_requests('edge_images') WHERE endpoint = '/v1/systemone' ORDER BY image_count;
+----
+8	200
+9	422
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'prompt_drex: a row returned NULL: HTTP 422: images: at most 8 images allowed (request req_%)';
+----
+1
+
+# A list holding a NULL, and an empty list, send nothing and return NULL, as a NULL input does
+statement ok
+FROM drex_reset('edge_images');
+
+query TT
+SELECT prompt_drex([red, NULL], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max'),
+       prompt_drex([]::BLOB[], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max')
+FROM img;
+----
+NULL	NULL
+
+query I
+SELECT count(*) FROM drex_requests('edge_images') WHERE endpoint = '/v1/systemone';
+----
+0
+
+# --- a body at Drex's 4 MiB limit is sent, and one byte over is not --------------------------------------------------
+
+# The red PNG is 751 bytes; 3,144,896 more make 3,145,647, a multiple of 3, whose base64 is 4,194,196 characters. With
+# instructions 'Image?xx' the whole body is 4,194,304 bytes, and with one more character 4,194,305
+statement ok
+FROM drex_reset('edge_images');
+
+query IRR
+SELECT octet_length(red), prompt_drex(red || repeat('a', 3144896)::BLOB, 'Image?xx', model := 'drex-max'),
+       prompt_drex(red || repeat('a', 3144896)::BLOB, 'Image?xxx', model := 'drex-max')
+FROM img;
+----
+751	0.75	NULL
+
+query II
+SELECT strlen(body::VARCHAR), status FROM drex_requests('edge_images') WHERE endpoint = '/v1/systemone';
+----
+4194304	200
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message = 'prompt_drex: a row returned NULL: the request body is 4194305 bytes, over Drex''s limit of 4194304; resize the images first';
+----
+1

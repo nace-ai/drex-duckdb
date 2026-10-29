@@ -1,0 +1,217 @@
+# name: test/sql/live/t5_matrix.test
+# description: question types, images, aliases, an unknown model and a too-long row, against the live Drex API
+# group: [live]
+
+# Run like prompt_drex_live.test, by .github/workflows/LiveTests.yml. The rows are synthetic and each answer is a
+# model's, so the assertions compare rows with each other or with a wide margin. About 30 billed requests
+require drex
+
+require httpfs
+
+require json
+
+require-env DREX_LIVE
+
+require-env DREX_LIVE_FIXTURES
+
+require-env NACE_API_KEY
+
+statement ok
+CREATE SECRET drex (TYPE nace, PROVIDER env);
+
+statement ok
+CREATE TABLE tickets AS SELECT * FROM (VALUES
+    (1, 'I was charged twice for my March invoice. Please refund one of the charges. No rush.'),
+    (2, 'The dashboard crashes with error 500 on every page and our whole team of 40 is blocked right now.')) t(id, body);
+
+statement ok
+CREATE TABLE png AS SELECT
+    (SELECT content FROM read_blob('{DREX_LIVE_FIXTURES}/red.png')) AS red,
+    (SELECT content FROM read_blob('{DREX_LIVE_FIXTURES}/blue.png')) AS blue;
+
+# --- every question type, on both models -----------------------------------------------------------------------------
+
+foreach model drex-v2.0 drex-max
+
+query IT
+SELECT id, prompt_drex(body, 'Is the customer asking for a refund?', model := '${model}') > 0.5
+FROM tickets ORDER BY id;
+----
+1	true
+2	false
+
+# Probabilities hold every label, sorted by label, and sum to 1
+query ITIII
+SELECT id, r.choice, len(r.probabilities),
+       [p.value FOR p IN r.probabilities] = ['billing', 'other', 'technical'],
+       abs(list_sum([p.probability FOR p IN r.probabilities]) - 1) < 0.01 AND r.confidence BETWEEN 0 AND 1
+FROM (SELECT id, prompt_drex(body, 'Which team should handle this support ticket?',
+                             choice := [{'label': 'technical', 'description': 'Bugs, crashes and errors'},
+                                        {'label': 'billing', 'description': 'Payments, invoices and refunds'},
+                                        {'label': 'other', 'description': NULL}],
+                             model := '${model}') AS r FROM tickets)
+ORDER BY id;
+----
+1	billing	3	true	true
+2	technical	3	true	true
+
+query T
+SELECT prompt_drex(body, 'Which team should handle this support ticket?', choice := ['billing', 'technical'],
+                   model := '${model}').choice
+FROM tickets WHERE id = 2;
+----
+technical
+
+query III
+SELECT len(r.probabilities), [p.index FOR p IN r.probabilities] = [0, 1, 2]::UINTEGER[], r.score BETWEEN 0 AND 2
+FROM (SELECT prompt_drex(body, 'How urgent is this ticket?', score := ['can wait', 'this week', 'today'],
+                         model := '${model}') AS r FROM tickets);
+----
+3	true	true
+3	true	true
+
+query I
+SELECT max(r.score) FILTER (id = 2) > max(r.score) FILTER (id = 1)
+FROM (SELECT id, prompt_drex(body, 'How urgent is this ticket?', score := ['can wait', 'this week', 'today'],
+                             model := '${model}') AS r FROM tickets);
+----
+true
+
+# All three types in one request per row
+query ITTI
+SELECT id, r.refund > 0.5, r.team.choice, r.urgency.score BETWEEN 0 AND 2
+FROM (SELECT id, prompt_drex(body, model := '${model}', questions := {
+    'refund': {'type': 'noul', 'instructions': 'Is the customer asking for a refund?'},
+    'team': {'type': 'choice', 'instructions': 'Which team should handle this ticket?', 'criteria': ['billing', 'technical']},
+    'urgency': {'type': 'score', 'instructions': 'How urgent is this ticket?', 'criteria': ['can wait', 'this week', 'today']}})
+    AS r FROM tickets)
+ORDER BY id;
+----
+1	true	billing	true
+2	false	technical	true
+
+# drex_decide sends the questions as written, so a choice's criteria take Drex's own form, an object of options
+query IITTI
+SELECT id, d->>'$.model' = '${model}', (d->>'$.answers.refund.noul')::DOUBLE > 0.5, d->>'$.answers.team.choice',
+       (d->>'$.request_id') LIKE 'req_%'
+FROM (SELECT id, drex_decide(to_json(body), '{
+    "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team": {"type": "choice", "instructions": "Which team should handle this ticket?",
+             "criteria": {"billing": "Payments, invoices and refunds", "technical": null}},
+    "urgency": {"type": "score", "instructions": "How urgent is this ticket?", "criteria": ["can wait", "this week", "today"]}}',
+    model := '${model}') AS d FROM tickets)
+ORDER BY id;
+----
+1	true	true	billing	true
+2	true	false	technical	true
+
+endloop
+
+# A JSON row is sent as structured state
+query I
+SELECT prompt_drex(to_json(tickets), 'Is the customer asking for a refund?') > 0.5 FROM tickets WHERE id = 1;
+----
+true
+
+# --- images on drex-max: 1, 2, 2 reversed and 8 ----------------------------------------------------------------------
+
+query TT
+SELECT prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice,
+       prompt_drex([blue], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM png;
+----
+red	blue
+
+query TT
+SELECT r.first.choice, r.second.choice
+FROM (SELECT prompt_drex([red, blue], model := 'drex-max', questions := {
+    'first': {'type': 'choice', 'instructions': 'What colour is Image 1?', 'criteria': ['red', 'blue']},
+    'second': {'type': 'choice', 'instructions': 'What colour is Image 2?', 'criteria': ['red', 'blue']}}) AS r FROM png);
+----
+red	blue
+
+query TT
+SELECT r.first.choice, r.second.choice
+FROM (SELECT prompt_drex([blue, red], model := 'drex-max', questions := {
+    'first': {'type': 'choice', 'instructions': 'What colour is Image 1?', 'criteria': ['red', 'blue']},
+    'second': {'type': 'choice', 'instructions': 'What colour is Image 2?', 'criteria': ['red', 'blue']}}) AS r FROM png);
+----
+blue	red
+
+# Drex's limit is 8 images; one question per image, in one request
+query TTTTTTTT
+SELECT r.i1.choice, r.i2.choice, r.i3.choice, r.i4.choice, r.i5.choice, r.i6.choice, r.i7.choice, r.i8.choice
+FROM (SELECT prompt_drex([red, blue, blue, red, blue, red, red, blue], model := 'drex-max', questions := {
+    'i1': {'type': 'choice', 'instructions': 'What colour is Image 1?', 'criteria': ['red', 'blue']},
+    'i2': {'type': 'choice', 'instructions': 'What colour is Image 2?', 'criteria': ['red', 'blue']},
+    'i3': {'type': 'choice', 'instructions': 'What colour is Image 3?', 'criteria': ['red', 'blue']},
+    'i4': {'type': 'choice', 'instructions': 'What colour is Image 4?', 'criteria': ['red', 'blue']},
+    'i5': {'type': 'choice', 'instructions': 'What colour is Image 5?', 'criteria': ['red', 'blue']},
+    'i6': {'type': 'choice', 'instructions': 'What colour is Image 6?', 'criteria': ['red', 'blue']},
+    'i7': {'type': 'choice', 'instructions': 'What colour is Image 7?', 'criteria': ['red', 'blue']},
+    'i8': {'type': 'choice', 'instructions': 'What colour is Image 8?', 'criteria': ['red', 'blue']}}) AS r FROM png);
+----
+red	blue	blue	red	blue	red	red	blue
+
+# --- aliases and versions --------------------------------------------------------------------------------------------
+
+query TI
+SELECT d->>'$.model', (d->>'$.answers.refund.noul')::DOUBLE > 0.5
+FROM (SELECT drex_decide(to_json(body), '{"refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}}',
+                         model := 'drex-latest') AS d FROM tickets WHERE id = 1);
+----
+drex-v2.0	true
+
+query TI
+SELECT d->>'$.model', (d->>'$.answers.refund.noul')::DOUBLE > 0.5
+FROM (SELECT drex_decide(to_json(body), '{"refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}}',
+                         model := 'drex-v1.5') AS d FROM tickets WHERE id = 1);
+----
+drex-v1.5	true
+
+query II
+SELECT prompt_drex(body, 'Is the customer asking for a refund?', model := 'drex-latest') > 0.5,
+       prompt_drex(body, 'Is the customer asking for a refund?', model := 'drex-v1.5') > 0.5
+FROM tickets WHERE id = 1;
+----
+true	true
+
+# --- an unknown model is refused before any row is sent --------------------------------------------------------------
+
+statement error
+SELECT drex_decide('"text"', '{"a": {"type": "noul", "instructions": "Is it?"}}', model := 'drex-v99.9');
+----
+<REGEX>:.*drex_decide: unknown model 'drex-v99\.9'.*
+
+statement error
+SELECT prompt_drex(body, 'Is it?', model := 'nacedm-unknown') FROM tickets;
+----
+<REGEX>:.*prompt_drex: unknown model 'nacedm-unknown'.*
+
+# --- a row over the token limit is NULL, and the other rows are answered ---------------------------------------------
+
+statement ok
+CALL enable_logging(level = 'warning', storage = 'memory');
+
+# drex-v2.0 takes 131,072 state tokens; this row is about 1.4 MB of text, well over them and under the 4 MiB body limit
+query II
+SELECT id, prompt_drex(body, 'Is the customer asking for a refund?') > 0.5
+FROM (SELECT id, body FROM tickets WHERE id = 1
+      UNION ALL SELECT 3, 'Please refund me. ' || repeat('synthetic filler line ', 64000)
+      UNION ALL SELECT 4, 'Please refund my last payment.')
+ORDER BY id;
+----
+1	true
+3	NULL
+4	true
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'WARNING' AND message LIKE 'prompt_drex: a row returned NULL: HTTP 422: %(request req_%)';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%synthetic filler%';
+----
+0

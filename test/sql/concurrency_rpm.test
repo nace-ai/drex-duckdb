@@ -1,0 +1,40 @@
+# name: test/sql/concurrency_rpm.test
+# description: a burst stays within the drex_max_rpm token bucket
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('concurrency_rpm');
+
+# 600 a minute: a bucket of 50 (5 seconds' worth) that refills at 10 a second
+statement ok
+SET drex_max_rpm = 600;
+
+statement ok
+SET drex_max_concurrency = 16;
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/concurrency_rpm/ok');
+
+query I
+SELECT count(prompt_drex('Ticket ' || i, 'Refund?')) FROM range(80) t(i);
+----
+80
+
+# Every request takes a token, the bind's GET /v1/models included. By the k-th request, at most the bucket's 50 and
+# 10 a second since the first can have been sent (plus one for the instant of the first)
+query II
+WITH requests AS (
+    SELECT row_number() OVER (ORDER BY received_at) AS k, received_at - min(received_at) OVER () AS since_first
+    FROM drex_requests('concurrency_rpm'))
+SELECT count(*), count(*) FILTER (WHERE k > 50 + 10 * since_first + 1) FROM requests;
+----
+81	0
+
+# And the bucket did hold the burst back: the 31 requests past the bucket took at least 3 seconds
+query I
+SELECT max(received_at) - min(received_at) >= 3 FROM drex_requests('concurrency_rpm');
+----
+true

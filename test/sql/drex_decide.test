@@ -1,0 +1,73 @@
+# name: test/sql/drex_decide.test
+# description: drex_decide sends state and questions as written and returns Drex's response as JSON
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('decide');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/decide/ok');
+
+statement ok
+CREATE TABLE decided AS SELECT drex_decide(
+    '"I was charged twice for my March invoice. Please refund one of the charges."',
+    '{"wants_refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}, "sentiment": {"type": "score", "instructions": "How upset is the customer?", "criteria": ["Calm", "Mildly annoyed", "Frustrated", "Angry"]}}') AS r;
+
+query TTRRT
+SELECT typeof(r), r->>'$.model', (r->>'$.answers.wants_refund.noul')::DOUBLE, (r->>'$.answers.sentiment.score')::DOUBLE,
+       (r->>'$.request_id') LIKE 'req_%'
+FROM decided;
+----
+JSON	drex-v2.0	0.9868	1.5306	true
+
+# Drex's own answer shapes, not prompt_jev's: probabilities keyed by level index
+query T
+SELECT r->>'$.answers.sentiment.probabilities.2' FROM decided;
+----
+0.2946
+
+# The body is state and questions as written, plus model. json() minifies, as -> does, so the two compare as text
+query TTTTT
+SELECT model, state_type, body->>'$.state', (body->'$.questions') = json('{"wants_refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}, "sentiment": {"type": "score", "instructions": "How upset is the customer?", "criteria": ["Calm", "Mildly annoyed", "Frustrated", "Angry"]}}'),
+       questions->>'$[*].id'
+FROM drex_requests('decide') WHERE endpoint = '/v1/systemone';
+----
+drex-v2.0	string	I was charged twice for my March invoice. Please refund one of the charges.	true	[wants_refund, sentiment]
+
+# A structured state stays structured, and model := picks the model
+query T
+SELECT drex_decide('{"ticket_id": "T-1042", "messages": [{"from": "customer", "text": "SSO is down for 40 people"}]}',
+                   '{"is_outage": {"type": "noul", "instructions": "Does this describe a service outage?", "criteria": {"true": "Many users cannot use the product", "false": "A single user or a question"}}}',
+                   model := 'drex-max')->>'$.answers.is_outage.noul';
+----
+0.7632
+
+query TTT
+SELECT model, state_type, body->>'$.state.messages[0].from' FROM drex_requests('decide')
+WHERE endpoint = '/v1/systemone' ORDER BY seq DESC LIMIT 1;
+----
+drex-max	object	customer
+
+# Nothing is added to or fixed in the questions, so a body Drex refuses fails the query with its issues
+statement error
+SELECT drex_decide('"text"', '{"a": {"type": "noul", "instructions": null}}');
+----
+<REGEX>:.*drex_decide: .*questions\.a\.instructions: must be a string.*
+
+query T
+SELECT json_type(body, '$.questions.a.instructions') FROM drex_requests('decide')
+WHERE endpoint = '/v1/systemone' ORDER BY seq DESC LIMIT 1;
+----
+NULL
+
+# Same headers as prompt_drex
+query IIII
+SELECT bool_and(user_agent LIKE 'duckdb-drex/%'), bool_and(x_nace_client = user_agent),
+       bool_and(coalesce(idempotency_key, '') <> ''),
+       bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000')
+FROM drex_requests('decide') WHERE endpoint = '/v1/systemone';
+----
+true	true	true	true

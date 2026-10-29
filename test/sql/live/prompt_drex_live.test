@@ -1,0 +1,90 @@
+# name: test/sql/live/prompt_drex_live.test
+# description: prompt_drex and drex_decide against the live Drex API, on drex-v2.0 and drex-max, with images
+# group: [live]
+
+# Only .github/workflows/LiveTests.yml runs this: it sets DREX_LIVE, NACE_API_KEY to the key of an @nace.ai account
+# (and NACE_BASE_URL to override production), and writes test/mock/pngs.py's PNGs to DREX_LIVE_FIXTURES. The answers
+# are a model's, so each assertion has a wide margin
+require drex
+
+require httpfs
+
+require json
+
+require-env DREX_LIVE
+
+require-env DREX_LIVE_FIXTURES
+
+require-env NACE_API_KEY
+
+# The env provider, so the key never appears in a failed statement
+statement ok
+CREATE SECRET drex (TYPE nace, PROVIDER env);
+
+statement ok
+CREATE TABLE tickets AS SELECT * FROM (VALUES
+    ('I was charged twice for my March invoice. Please refund one of the charges.')) t(body);
+
+statement ok
+CREATE TABLE png AS SELECT
+    (SELECT content FROM read_blob('{DREX_LIVE_FIXTURES}/red.png')) AS red,
+    (SELECT content FROM read_blob('{DREX_LIVE_FIXTURES}/blue.png')) AS blue;
+
+# --- drex-v2.0 -------------------------------------------------------------------------------------------------------
+
+query I
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') > 0.5 FROM tickets;
+----
+true
+
+query TI
+SELECT r.choice, abs(list_sum([p.probability FOR p IN r.probabilities]) - 1) < 0.01
+FROM (SELECT prompt_drex(body, 'What is this support ticket about?',
+                         choice := [{'label': 'billing', 'description': 'Payments, invoices, refunds, or charges'},
+                                    {'label': 'technical', 'description': 'Bugs, errors, or outages'},
+                                    {'label': 'other', 'description': NULL}]) AS r FROM tickets);
+----
+billing	true
+
+query II
+SELECT len(r.probabilities), r.score BETWEEN 0 AND 3
+FROM (SELECT prompt_drex(body, 'How upset is the customer?', score := ['Calm', 'Mildly annoyed', 'Frustrated', 'Angry'],
+                         model := 'drex-v2.0') AS r FROM tickets);
+----
+4	true
+
+query TI
+SELECT d->>'$.model', (d->>'$.answers.refund.noul')::DOUBLE > 0.5
+FROM (SELECT drex_decide(to_json(body), '{"refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}}')
+      AS d FROM tickets);
+----
+drex-v2.0	true
+
+# The model is checked against the live GET /v1/models, so a name Drex would silently serve is refused
+statement error
+SELECT prompt_drex('text', 'Is it?', model := 'drex-v99.9');
+----
+<REGEX>:.*prompt_drex: unknown model 'drex-v99\.9'.*
+
+# --- drex-max, with images -------------------------------------------------------------------------------------------
+
+query II
+SELECT r.refund > 0.5, r.topic.choice
+FROM (SELECT prompt_drex(body, model := 'drex-max', questions := {
+    'refund': {'type': 'noul', 'instructions': 'Is the customer asking for a refund?'},
+    'topic': {'type': 'choice', 'instructions': 'What is this ticket about?', 'criteria': ['billing', 'technical']}})
+    AS r FROM tickets);
+----
+true	billing
+
+query TT
+SELECT prompt_drex([red, blue], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice,
+       prompt_drex([red, blue], 'What colour is Image 2?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM png;
+----
+red	blue
+
+query T
+SELECT prompt_drex(blue, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice FROM png;
+----
+blue

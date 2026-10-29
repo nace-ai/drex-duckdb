@@ -1,0 +1,87 @@
+# name: test/sql/semantics_restart.test
+# description: a persistent nace secret is used after a restart, and enable_external_access = false sends nothing
+# group: [sql]
+
+require noforcestorage
+
+# A file database keeps the request log's macros across the restart
+load {TEST_DIR}/semantics_restart.db
+
+# Before the request log's first read, which looks up secrets
+statement ok
+SET secret_directory = '{TEST_DIR}/semantics_restart_secrets';
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('semantics_restart');
+
+# --- a persistent secret, before and after a restart -----------------------------------------------------------------
+
+statement ok
+CREATE PERSISTENT SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_444444444444444',
+    BASE_URL '{DREX_MOCK_URL}/ns/semantics_restart/ok');
+
+query R
+SELECT prompt_drex('before', 'Refund?');
+----
+0.75
+
+restart
+
+statement ok
+SET secret_directory = '{TEST_DIR}/semantics_restart_secrets';
+
+statement ok
+SET enable_external_file_cache = false;
+
+query II
+SELECT persistent, secret_string LIKE '%api_key=redacted%' AND secret_string NOT LIKE '%444444444444444%'
+FROM duckdb_secrets() WHERE name = 'drex';
+----
+true	true
+
+query R
+SELECT prompt_drex('after', 'Refund?');
+----
+0.75
+
+query TT
+SELECT state, authorization_header FROM drex_requests('semantics_restart') WHERE endpoint = '/v1/systemone'
+ORDER BY seq;
+----
+"before"	Bearer nace_sk_mockKeyForDrexContractTests_444444444444444
+"after"	Bearer nace_sk_mockKeyForDrexContractTests_444444444444444
+
+statement ok
+DROP PERSISTENT SECRET drex;
+
+# --- enable_external_access = false ----------------------------------------------------------------------------------
+
+# Temporary, since external access off also closes the secret directory
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/semantics_restart/ok');
+
+statement ok
+SET enable_external_access = false;
+
+# The model list is cached, so binding and EXPLAIN work, and DuckDB refuses the request before it is sent
+statement ok
+EXPLAIN SELECT prompt_drex('refused', 'Refund?');
+
+statement error
+SELECT prompt_drex('refused', 'Refund?');
+----
+<REGEX>:Permission Error: prompt_drex: Cannot access "http://.*/v1/systemone" - file system operations are disabled by configuration.*
+
+statement error
+SELECT drex_decide('"refused"', '{"a": {"type": "noul", "instructions": "Refund?"}}');
+----
+<REGEX>:Permission Error: drex_decide: Cannot access "http://.*/v1/systemone" - file system operations are disabled by configuration.*
+
+# A model missing from the cached list reads GET /v1/models again, which is refused at bind
+statement error
+SELECT prompt_drex('refused', 'Refund?', model := 'drex-v9.9');
+----
+<REGEX>:Permission Error: prompt_drex: Cannot access "http://.*/v1/models" - file system operations are disabled by configuration.*

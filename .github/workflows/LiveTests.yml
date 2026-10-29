@@ -1,0 +1,52 @@
+#
+# Runs opt-in tests against the production Drex API using NACE_LIVE_API_KEY.
+# These tests make billed requests; enable the schedule only after configuring a dedicated test account.
+#
+name: Live Tests
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  live-tests:
+    name: SQLLogicTests against the live API
+    runs-on: ubuntu-latest
+    env:
+      NACE_API_KEY: ${{ secrets.NACE_LIVE_API_KEY }}
+    steps:
+      - name: Check the API key
+        run: |
+          if [ -z "$NACE_API_KEY" ]; then
+            echo "::error::The NACE_LIVE_API_KEY secret is not available to this repository"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev libcurl4-openssl-dev
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Shares the mock job's cache: the build is the same
+          key: mock-contract-tests-${{ runner.os }}
+
+      - name: Build
+        env:
+          GEN: ninja
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: make release
+
+      - name: Run the live SQLLogicTests
+        env:
+          DREX_LIVE: '1'
+          DREX_LIVE_FIXTURES: ${{ runner.temp }}/fixtures
+        run: |
+          python3 test/mock/pngs.py "$DREX_LIVE_FIXTURES"
+          build/release/test/unittest "test/sql/live/*"

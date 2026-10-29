@@ -1,0 +1,79 @@
+# name: test/sql/edge_models.test
+# description: aliases and retired ids are sent as named and served by their version; other names are refused at bind
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('edge_models');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_models/ok');
+
+statement ok
+CREATE TABLE png AS SELECT (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/red.png')) AS red;
+
+# --- names GET /v1/models lists --------------------------------------------------------------------------------------
+
+query RRT
+SELECT prompt_drex('text', 'Refund?', model := 'drex-latest'),
+       prompt_drex('text', 'Refund?', model := 'drex-v1.5'),
+       prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-v1.0').choice
+FROM png;
+----
+0.75	0.75	red
+
+# Each is sent under the name the query gave; drex-v1.0, retired, is served by drex-max, which reads its image
+query TTI
+SELECT model, served_model, image_count FROM drex_requests('edge_models') WHERE endpoint = '/v1/systemone'
+ORDER BY model;
+----
+drex-latest	drex-v2.0	0
+drex-v1.0	drex-max	1
+drex-v1.5	drex-v1.5	0
+
+# drex-latest points at drex-v2.0, which reads no images
+statement error
+SELECT prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-latest') FROM png;
+----
+<REGEX>:.*prompt_drex: drex-latest does not read images; use an image model such as drex-max.*
+
+# --- names it does not list ------------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_models');
+
+# An unknown name, including an unregistered drex-* one
+statement error
+SELECT prompt_drex('text', 'Refund?', model := 'gpt-4o');
+----
+<REGEX>:.*prompt_drex: unknown model 'gpt-4o'; GET /v1/models lists drex-v1\.5, drex-v2\.0, drex-max, .*
+
+statement error
+SELECT drex_decide('"text"', '{"a": {"type": "noul", "instructions": "Refund?"}}', model := 'drex-v9.9');
+----
+<REGEX>:.*drex_decide: unknown model 'drex-v9\.9'; GET /v1/models lists .*
+
+# Model ids are case-sensitive, in Drex (lib/models.ts looks them up with Object.hasOwn) and here
+statement error
+SELECT prompt_drex('text', 'Refund?', model := 'Drex-V2.0');
+----
+<REGEX>:.*prompt_drex: unknown model 'Drex-V2\.0'.*
+
+statement error
+SELECT prompt_drex('text', 'Refund?', model := 'DREX-LATEST');
+----
+<REGEX>:.*prompt_drex: unknown model 'DREX-LATEST'.*
+
+statement error
+SELECT prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'Drex-Max') FROM png;
+----
+<REGEX>:.*prompt_drex: unknown model 'Drex-Max'.*
+
+# None was sent, and each refusal followed a successful GET /v1/models, fetched again for the name it lacked
+query II
+SELECT count(*) FILTER (endpoint = '/v1/systemone'), count(*) FILTER (endpoint = '/v1/models' AND status = 200)
+FROM drex_requests('edge_models');
+----
+0	5

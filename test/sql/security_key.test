@@ -1,0 +1,146 @@
+# name: test/sql/security_key.test
+# description: the secret's API key never appears in secrets, plans, profiling output, logs, warnings or errors
+# group: [sql]
+
+# The key is a recognisable fake, T6canaryKeyLeakCheck..., which every check below looks for
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('security_key');
+
+# Defined before logging starts, so no logged statement holds the key's text but CREATE SECRET's own
+statement ok
+CREATE MACRO holds_key(text) AS text LIKE '%' || 'T6canary' || '%';
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/security_key/ok');
+
+query II
+SELECT secret_string LIKE '%api_key=redacted%', holds_key(secret_string) FROM duckdb_secrets();
+----
+true	false
+
+statement ok
+CALL enable_logging(level = 'trace', storage = 'memory');
+
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '__TEST_DIR__/security_key_profile.json';
+
+query R
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+0.75
+
+statement ok
+SET enable_profiling = 'no_output';
+
+query II
+SELECT content LIKE '%prompt_drex%', holds_key(content) FROM read_text('__TEST_DIR__/security_key_profile.json');
+----
+true	false
+
+query II
+EXPLAIN SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+physical_plan	<!REGEX>:.*T6canary.*
+
+query II
+EXPLAIN ANALYZE SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+analyzed_plan	<!REGEX>:.*T6canary.*
+
+# --- warnings: a row NULL with a reason ------------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/security_key/too-long');
+
+query R
+SELECT prompt_drex(repeat('Please refund me. ', 300), 'Refund?');
+----
+NULL
+
+# --- errors that fail the query: each once for its message, once for the key's absence -------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/security_key/401');
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+prompt_drex: Invalid API key
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+<!REGEX>:.*T6canary.*
+
+statement error
+SELECT drex_decide('"I was charged twice"', '{"a": {"type": "noul", "instructions": "Refund?"}}');
+----
+drex_decide: Invalid API key
+
+statement error
+SELECT drex_decide('"I was charged twice"', '{"a": {"type": "noul", "instructions": "Refund?"}}');
+----
+<!REGEX>:.*T6canary.*
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/security_key/402');
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+dashboard/billing
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+<!REGEX>:.*T6canary.*
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/security_key/422');
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+prompt_drex: Drex refused the request
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+<!REGEX>:.*T6canary.*
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?', model := 'drex-v99.9');
+----
+<!REGEX>:.*T6canary.*
+
+statement error
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000',
+    BASE_URL 'ftp://example.com');
+----
+<!REGEX>:.*T6canary.*
+
+# --- the log ---------------------------------------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'WARNING' AND message LIKE 'prompt_drex: a row returned NULL: HTTP 422: state: %';
+----
+1
+
+# DuckDB's QueryLog records each statement's text, CREATE SECRET's included, as it does for every secret type. Nothing
+# else holds the key
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE holds_key(message) AND NOT (type = 'QueryLog' AND message LIKE 'CREATE OR REPLACE SECRET drex %');
+----
+0

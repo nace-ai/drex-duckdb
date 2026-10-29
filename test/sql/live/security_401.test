@@ -1,0 +1,30 @@
+# name: test/sql/live/security_401.test
+# description: production Drex's 401, reached over verified TLS, never quotes the API key
+# group: [live]
+
+# A fake key, so nothing is billed. Only .github/workflows/LiveTests.yml runs this, with DREX_LIVE set
+require drex
+
+require httpfs
+
+require json
+
+require-env DREX_LIVE
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_T6canaryKeyLeakCheckDoNotUse000000000000000');
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+prompt_drex: Invalid API key
+
+statement error
+SELECT prompt_drex('I was charged twice', 'Refund?');
+----
+<!REGEX>:.*T6canary.*
+
+statement error
+SELECT drex_decide('"I was charged twice"', '{"a": {"type": "noul", "instructions": "Refund?"}}');
+----
+<!REGEX>:.*T6canary.*

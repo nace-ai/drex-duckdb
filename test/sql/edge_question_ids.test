@@ -1,0 +1,124 @@
+# name: test/sql/edge_question_ids.test
+# description: question ids become STRUCT field names, so two that differ only in case are refused; any other id works
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('edge_question_ids');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_question_ids/ok');
+
+# --- ids that differ only in case ------------------------------------------------------------------------------------
+
+# Drex's ids are JSON keys, so it takes both; DuckDB's STRUCT field names ignore case, so prompt_drex could not return
+# them as two fields and refuses them at bind
+statement error
+SELECT prompt_drex('text', questions := '{"Refund": {"type": "noul", "instructions": "Refund?"},
+                                          "refund": {"type": "noul", "instructions": "Refund now?"}}'::JSON);
+----
+<REGEX>:.*prompt_drex: question ids must be unique ignoring case; 'refund' is a duplicate.*
+
+# The same id twice is refused too, where Drex would keep only the last
+statement error
+SELECT prompt_drex('text', questions := '{"refund": {"type": "noul", "instructions": "Refund?"},
+                                          "refund": {"type": "noul", "instructions": "Refund now?"}}'::JSON);
+----
+<REGEX>:.*prompt_drex: question ids must be unique ignoring case; 'refund' is a duplicate.*
+
+# In the STRUCT form, DuckDB refuses them itself
+statement error
+SELECT prompt_drex('text', questions := {'Refund': {'type': 'noul', 'instructions': 'Refund?'},
+                                         'refund': {'type': 'noul', 'instructions': 'Refund now?'}});
+----
+<REGEX>:.*Duplicate.*refund.*
+
+# DuckDB folds only ASCII letters, so 'É' and 'é' are two fields, both to DuckDB and to prompt_drex
+query TRR
+SELECT typeof(r), r."É", r."é".score
+FROM (SELECT prompt_drex('text', questions := '{"É": {"type": "noul", "instructions": "Upper?"},
+                                                "é": {"type": "score", "instructions": "Lower?", "criteria": ["a", "b"]}}'::JSON) AS r);
+----
+STRUCT("É" DOUBLE, "é" STRUCT(score DOUBLE, probabilities STRUCT("index" UINTEGER, "value" VARCHAR, probability DOUBLE)[], confidence DOUBLE))	0.75	0.6667
+
+# An id keeps its case in the request and the type, and reads in any case
+query TRR
+SELECT typeof(r), r.refund, r.REFUND
+FROM (SELECT prompt_drex('text', questions := '{"ReFund": {"type": "noul", "instructions": "Refund?"}}'::JSON) AS r);
+----
+STRUCT(ReFund DOUBLE)	0.75	0.75
+
+query I
+SELECT count(*) FROM drex_requests('edge_question_ids') WHERE endpoint = '/v1/systemone';
+----
+2
+
+# --- ids with spaces, dots, quotes and SQL keywords ------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_question_ids');
+
+statement ok
+CREATE TABLE answers AS SELECT prompt_drex('text', questions := '{
+    "a b": {"type": "noul", "instructions": "One?"},
+    "a.b": {"type": "noul", "instructions": "Two?"},
+    " padded ": {"type": "noul", "instructions": "Three?"},
+    "say \"hi\"": {"type": "noul", "instructions": "Four?"},
+    "select": {"type": "noul", "instructions": "Five?"},
+    "from": {"type": "choice", "instructions": "Six?", "criteria": ["x", "y"]},
+    "ünï 😀": {"type": "noul", "instructions": "Seven?"}}'::JSON) AS r;
+
+query T
+SELECT typeof(r) FROM answers;
+----
+STRUCT("a b" DOUBLE, "a.b" DOUBLE, " padded " DOUBLE, "say ""hi""" DOUBLE, "select" DOUBLE, "from" STRUCT(choice VARCHAR, probabilities STRUCT("value" VARCHAR, probability DOUBLE)[], confidence DOUBLE), "ünï 😀" DOUBLE)
+
+query RRRRRTR
+SELECT r."a b", r."a.b", r." padded ", r."say ""hi""", r."select", r."from".choice, r."ünï 😀" FROM answers;
+----
+0.75	0.75	0.75	0.75	0.75	x	0.75
+
+# Sent as written, in order, in one request
+query IT
+SELECT question_count, [q->>'id' FOR q IN questions::JSON[]]
+FROM drex_requests('edge_question_ids') WHERE endpoint = '/v1/systemone';
+----
+7	[a b, a.b, ' padded ', 'say "hi"', select, from, ünï 😀]
+
+# The STRUCT form takes the same names
+query RR
+SELECT r."a.b", r."select" FROM (SELECT prompt_drex('text', questions := {
+    'a.b': {'type': 'noul', 'instructions': 'One?'}, 'select': {'type': 'noul', 'instructions': 'Two?'}}) AS r);
+----
+0.75	0.75
+
+# --- an empty or blank id is refused at bind, as Drex refuses it -----------------------------------------------------
+
+statement error
+SELECT prompt_drex('text', questions := '{"": {"type": "noul", "instructions": "Refund?"}}'::JSON);
+----
+<REGEX>:.*prompt_drex: question ids must not be empty.*
+
+statement error
+SELECT prompt_drex('text', questions := '{" \t": {"type": "noul", "instructions": "Refund?"}}'::JSON);
+----
+<REGEX>:.*prompt_drex: question ids must not be empty.*
+
+# --- __proto__ is refused at bind, since Drex would bill the request and drop its answer -------------------------------
+
+statement error
+SELECT prompt_drex('text', questions := '{"__proto__": {"type": "noul", "instructions": "Refund?"}}'::JSON);
+----
+<REGEX>:.*prompt_drex: the question id '__proto__' is not allowed: Drex can't answer it.*
+
+statement error
+SELECT prompt_drex('text', questions := {'__proto__': {'type': 'noul', 'instructions': 'Refund?'}});
+----
+<REGEX>:.*prompt_drex: the question id '__proto__' is not allowed: Drex can't answer it.*
+
+query I
+SELECT count(*) FROM drex_requests('edge_question_ids') WHERE endpoint = '/v1/systemone';
+----
+2

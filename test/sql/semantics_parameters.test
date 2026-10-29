@@ -1,0 +1,46 @@
+# name: test/sql/semantics_parameters.test
+# description: a prepared parameter as prompt_drex's input binds when the statement runs, with the value's type
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('semantics_parameters');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/semantics_parameters/ok');
+
+# Python's execute(sql, parameters) prepares the statement this way
+statement ok
+PREPARE text_input AS SELECT prompt_drex($1, 'Refund?');
+
+query R
+EXECUTE text_input('first');
+----
+0.75
+
+query R
+EXECUTE text_input('second');
+----
+0.75
+
+statement ok
+PREPARE image_input AS SELECT prompt_drex($1, 'What colour is Image 1?', choice := ['red', 'blue'],
+    model := 'drex-max').choice;
+
+statement ok
+SET VARIABLE blue = (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/blue.png'));
+
+query T
+EXECUTE image_input(getvariable('blue'));
+----
+blue
+
+query TT
+SELECT state, image_colours::VARCHAR FROM drex_requests('semantics_parameters') WHERE endpoint = '/v1/systemone'
+ORDER BY seq;
+----
+"first"	[]
+"second"	[]
+""	[blue]

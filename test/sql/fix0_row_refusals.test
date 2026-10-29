@@ -1,0 +1,122 @@
+# name: test/sql/fix0_row_refusals.test
+# description: a 422 caused by the row, or an image that is not one, makes that row NULL; one caused by the query fails it
+# group: [sql]
+
+# The too-long scenario refuses a request over 1,024 tokens (4 bytes of state each, 258 an image) as Drex does
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('row_refusals');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/row_refusals/too-long');
+
+statement ok
+CREATE TABLE png AS SELECT
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/red.png')) AS red,
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/blue.png')) AS blue;
+
+statement ok
+CALL enable_logging(level = 'warning', storage = 'memory');
+
+# --- a state over the limit (issue path state) -----------------------------------------------------------------------
+
+query IR
+SELECT id, prompt_drex(body, 'Refund?')
+FROM (VALUES (1, 'Please refund me.'), (2, 'Please refund me. ' || repeat('secret-row-content ', 300)),
+             (3, 'Please refund me.')) t(id, body)
+ORDER BY id;
+----
+1	0.75
+2	NULL
+3	0.75
+
+# Every row was sent once: a 422 is final
+query II
+SELECT count(*), count(DISTINCT state) FROM drex_requests('row_refusals') WHERE endpoint = '/v1/systemone';
+----
+3	2
+
+# The warning names the reason, never the row's content
+query T
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'WARNING'
+  AND message LIKE 'prompt_drex: a row returned NULL: HTTP 422: state: exceeds the 1,024-token state limit (request req_%)';
+----
+1
+
+query T
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%secret-row-content%';
+----
+0
+
+# drex_decide does the same
+query IT
+SELECT id, drex_decide(state, '{"a": {"type": "noul", "instructions": "Refund?"}}')->>'$.answers.a.noul'
+FROM (VALUES (1, '"Please refund me."'), (2, to_json(repeat('x', 5000))::VARCHAR)) t(id, state)
+ORDER BY id;
+----
+1	0.75
+2	NULL
+
+# --- a whole request over the limit (issue path "") ------------------------------------------------------------------
+
+# Four images are 1,032 tokens
+query IT
+SELECT n, prompt_drex(images, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM (SELECT 1, [red] FROM png UNION ALL SELECT 2, [blue, red, red, red] FROM png UNION ALL SELECT 3, [blue] FROM png)
+    t(n, images)
+ORDER BY n;
+----
+1	red
+2	NULL
+3	blue
+
+query T
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'prompt_drex: a row returned NULL: HTTP 422: exceeds the 1,024-token whole-request limit (request req_%)';
+----
+1
+
+# --- an image that is not a PNG, JPEG or WebP ------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('row_refusals');
+
+query IT
+SELECT n, prompt_drex(image, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM (SELECT 1, red FROM png UNION ALL SELECT 2, 'GIF89a'::BLOB UNION ALL SELECT 3, blue FROM png) t(n, image)
+ORDER BY n;
+----
+1	red
+2	NULL
+3	blue
+
+# In a list, too; the row is never sent
+query IT
+SELECT n, prompt_drex(images, 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM (SELECT 1, [red, 'not an image'::BLOB] FROM png UNION ALL SELECT 2, [blue] FROM png) t(n, images)
+ORDER BY n;
+----
+1	NULL
+2	blue
+
+query I
+SELECT count(*) FROM drex_requests('row_refusals') WHERE endpoint = '/v1/systemone';
+----
+3
+
+query T
+SELECT count(*) FROM duckdb_logs
+WHERE message = 'prompt_drex: a row returned NULL: image 2 is not a PNG, JPEG or WebP image';
+----
+1
+
+# --- a 422 caused by the query still fails it, with every issue ------------------------------------------------------
+
+statement error
+SELECT drex_decide(state, '{"a": {"type": "noul", "instructions": 1}}')
+FROM (VALUES ('"Please refund me."'), (to_json(repeat('x', 5000))::VARCHAR)) t(state);
+----
+<REGEX>:.*drex_decide: Drex refused the request: questions\.a\.instructions: must be a string; questions\.a\.instructions: noul needs instructions or criteria.*

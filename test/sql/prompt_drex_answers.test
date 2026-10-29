@@ -1,0 +1,351 @@
+# name: test/sql/prompt_drex_answers.test
+# description: prompt_drex maps Drex's noul, choice and score answers to prompt_jev's types, one request per row
+# group: [sql]
+
+# Needs the mock (test/mock/drex_mock.py); CI's mock job sets DREX_MOCK_URL. The mock answers the documented example
+# questions in openapi.json with their documented answers, whatever the question id
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/answers/ok');
+
+statement ok
+CREATE TABLE tickets AS SELECT * FROM (VALUES
+    (1, 'I was charged twice for my March invoice. Please refund one of the charges.')) t(id, body);
+
+# --- noul ------------------------------------------------------------------------------------------------------------
+
+# Without noul, choice, score or questions, prompt_drex asks a noul and returns its probability as a DOUBLE
+statement ok
+CREATE TABLE noul_v2 AS SELECT prompt_drex(body, 'Is the customer asking for a refund?') AS r FROM tickets;
+
+query TR
+SELECT typeof(r), round(r, 4) FROM noul_v2;
+----
+DOUBLE	0.9868
+
+statement ok
+CREATE TABLE noul_max AS
+SELECT prompt_drex(body, 'Is the customer asking for a refund?', model := 'drex-max') AS r FROM tickets;
+
+query TR
+SELECT typeof(r), round(r, 4) FROM noul_max;
+----
+DOUBLE	0.9868
+
+query TTIT
+SELECT model, served_model, question_count, questions->>'$[0].type' FROM drex_requests('answers')
+WHERE endpoint = '/v1/systemone' ORDER BY seq;
+----
+drex-v2.0	drex-v2.0	1	noul
+drex-max	drex-max	1	noul
+
+# The binder checked the models against GET /v1/models (it may cache the list), with the same key and attribution.
+# Checked before any reset, since a cached list sends no second request
+query II
+SELECT count(*) > 0, bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000'
+                              AND user_agent LIKE 'duckdb-drex/%' AND status = 200)
+FROM drex_requests('answers') WHERE endpoint = '/v1/models';
+----
+true	true
+
+# A noul with criteria and no instructions: `instructions` is still sent, as "" (Drex refuses null)
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+CREATE TABLE noul_criteria AS
+SELECT prompt_drex(body, questions := '{"outage": {"type": "noul", "criteria": {"true": "Many users cannot use the product", "false": "A single user or a question"}}}'::JSON) AS r
+FROM tickets;
+
+query R
+SELECT round(r.outage, 4) FROM noul_criteria;
+----
+0.75
+
+query TTTT
+SELECT json_type(questions, '$[0].instructions'), questions->>'$[0].instructions', questions->>'$[0].criteria.true',
+       questions->>'$[0].criteria.false'
+FROM drex_requests('answers') WHERE endpoint = '/v1/systemone';
+----
+VARCHAR	(empty)	Many users cannot use the product	A single user or a question
+
+# noul := takes prompt_jev's forms, with the labels true and false: their descriptions become criteria.true and
+# criteria.false. Here with no instructions, which are sent as ""
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+CREATE TABLE noul_named AS
+SELECT prompt_drex(body, noul := [{'label': 'true', 'description': 'Many users cannot use the product'},
+                                  {'label': 'false', 'description': NULL}]) AS r
+FROM tickets;
+
+query TR
+SELECT typeof(r), round(r, 4) FROM noul_named;
+----
+DOUBLE	0.75
+
+query TTTT
+SELECT json_type(questions, '$[0].instructions'), questions->>'$[0].instructions', questions->>'$[0].criteria.true',
+       coalesce(json_type(questions, '$[0].criteria.false'), 'absent') IN ('NULL', 'absent')
+FROM drex_requests('answers') WHERE endpoint = '/v1/systemone';
+----
+VARCHAR	(empty)	Many users cannot use the product	true
+
+# With instructions and both descriptions it is openapi.json's documented outage question
+statement ok
+CREATE TABLE noul_outage AS
+SELECT prompt_drex(body, 'Does this describe a service outage?',
+                   noul := [{'label': 'true', 'description': 'Many users cannot use the product'},
+                            {'label': 'false', 'description': 'A single user or a question'}]) AS r
+FROM tickets;
+
+query R
+SELECT round(r, 4) FROM noul_outage;
+----
+0.7632
+
+# Labels alone are the same as leaving noul out: no criteria are sent
+query R
+SELECT round(prompt_drex(body, 'Is the customer asking for a refund?', noul := ['true', 'false']), 4) FROM tickets;
+----
+0.9868
+
+query T
+SELECT coalesce(json_type(questions, '$[0].criteria'), 'absent') IN ('NULL', 'absent')
+FROM drex_requests('answers') WHERE endpoint = '/v1/systemone' ORDER BY seq DESC LIMIT 1;
+----
+true
+
+# --- choice ----------------------------------------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('answers');
+
+# Labels with descriptions, one of them NULL. Probabilities come back sorted by label, as prompt_jev's do
+statement ok
+CREATE TABLE choice_v2 AS
+SELECT prompt_drex(body, 'What is this support ticket about?', choice := [
+    {'label': 'billing', 'description': 'Payments, invoices, refunds, or charges'},
+    {'label': 'technical', 'description': 'Bugs, errors, or outages'},
+    {'label': 'account', 'description': 'Login, profile, or permissions'},
+    {'label': 'other', 'description': NULL}]) AS r
+FROM tickets;
+
+query I
+SELECT typeof(r) = typeof(NULL::STRUCT(choice VARCHAR, probabilities STRUCT("value" VARCHAR, probability DOUBLE)[],
+                                       confidence DOUBLE))
+FROM choice_v2;
+----
+true
+
+query TRTT
+SELECT r.choice, round(r.confidence, 4), list_transform(r.probabilities, lambda p: p.value),
+       list_transform(r.probabilities, lambda p: round(p.probability, 4))
+FROM choice_v2;
+----
+billing	0.986	[account, billing, other, technical]	[0.0006, 0.9895, 0.0049, 0.005]
+
+# The NULL description is sent as JSON null, not dropped and not ""
+query TTT
+SELECT json_type(questions, '$[0].criteria'), json_type(questions, '$[0].criteria.other'),
+       questions->>'$[0].criteria.billing'
+FROM drex_requests('answers') WHERE endpoint = '/v1/systemone';
+----
+OBJECT	NULL	Payments, invoices, refunds, or charges
+
+# Plain labels on Drex Max: the mock picks the first label with weights 4, 3, 2, 1
+statement ok
+CREATE TABLE choice_max AS
+SELECT prompt_drex(body, 'What is this support ticket about?', choice := ['billing', 'technical', 'account', 'other'],
+                   model := 'drex-max') AS r
+FROM tickets;
+
+query TTT
+SELECT r.choice, list_transform(r.probabilities, lambda p: p.value),
+       list_transform(r.probabilities, lambda p: round(p.probability, 4))
+FROM choice_max;
+----
+billing	[account, billing, other, technical]	[0.2, 0.4, 0.1, 0.3]
+
+query TT
+SELECT model, json_type(questions, '$[0].criteria.account') FROM drex_requests('answers')
+WHERE endpoint = '/v1/systemone' ORDER BY seq DESC LIMIT 1;
+----
+drex-max	NULL
+
+# --- score -----------------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE score_v2 AS
+SELECT prompt_drex(body, 'How upset is the customer?', score := ['Calm', 'Mildly annoyed', 'Frustrated', 'Angry']) AS r
+FROM tickets;
+
+statement ok
+CREATE TABLE score_max AS
+SELECT prompt_drex(body, 'How upset is the customer?', score := ['Calm', 'Mildly annoyed', 'Frustrated', 'Angry'],
+                   model := 'drex-max') AS r
+FROM tickets;
+
+query I
+SELECT typeof(r) = typeof(NULL::STRUCT(score DOUBLE,
+                                       probabilities STRUCT("index" UINTEGER, "value" VARCHAR, probability DOUBLE)[],
+                                       confidence DOUBLE))
+FROM (SELECT r FROM score_v2 UNION ALL SELECT r FROM score_max);
+----
+true
+true
+
+query RTTTR
+SELECT round(r.score, 4), list_transform(r.probabilities, lambda p: p.index), list_transform(r.probabilities, lambda p: p.value),
+       list_transform(r.probabilities, lambda p: round(p.probability, 4)), round(r.confidence, 4)
+FROM (SELECT r FROM score_v2 UNION ALL SELECT r FROM score_max);
+----
+1.5306	[0, 1, 2, 3]	[Calm, Mildly annoyed, Frustrated, Angry]	[0.1572, 0.3516, 0.2946, 0.1966]	0.7183
+1.5306	[0, 1, 2, 3]	[Calm, Mildly annoyed, Frustrated, Angry]	[0.1572, 0.3516, 0.2946, 0.1966]	0.7183
+
+query TT
+SELECT model, questions->>'$[0].criteria' FROM drex_requests('answers')
+WHERE endpoint = '/v1/systemone' AND (questions->>'$[0].type') = 'score' ORDER BY seq;
+----
+drex-v2.0	["Calm","Mildly annoyed","Frustrated","Angry"]
+drex-max	["Calm","Mildly annoyed","Frustrated","Angry"]
+
+# --- a mixed questions batch: one request, one named field per question -----------------------------------------------
+
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+CREATE TABLE mixed_struct AS
+SELECT prompt_drex(body, questions := {
+    'category': {'type': 'choice', 'instructions': 'What is this support ticket about?', 'criteria': [
+        {'label': 'billing', 'description': 'Payments, invoices, refunds, or charges'},
+        {'label': 'technical', 'description': 'Bugs, errors, or outages'},
+        {'label': 'account', 'description': 'Login, profile, or permissions'},
+        {'label': 'other', 'description': NULL}]},
+    'sentiment': {'type': 'score', 'instructions': 'How upset is the customer?',
+                  'criteria': ['Calm', 'Mildly annoyed', 'Frustrated', 'Angry']},
+    'wants_refund': {'type': 'noul', 'instructions': 'Is the customer asking for a refund?'}}) AS r
+FROM tickets;
+
+statement ok
+CREATE TABLE mixed_json AS
+SELECT prompt_drex(body, questions := '{
+    "category": {"type": "choice", "instructions": "What is this support ticket about?", "criteria": [
+        {"label": "billing", "description": "Payments, invoices, refunds, or charges"},
+        {"label": "technical", "description": "Bugs, errors, or outages"},
+        {"label": "account", "description": "Login, profile, or permissions"},
+        {"label": "other", "description": null}]},
+    "sentiment": {"type": "score", "instructions": "How upset is the customer?",
+                  "criteria": ["Calm", "Mildly annoyed", "Frustrated", "Angry"]},
+    "wants_refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}}'::JSON) AS r
+FROM tickets;
+
+query TRRR
+SELECT r.category.choice, round(r.category.confidence, 4), round(r.sentiment.score, 4), round(r.wants_refund, 4)
+FROM (SELECT r FROM mixed_struct UNION ALL SELECT r FROM mixed_json);
+----
+billing	0.986	1.5306	0.9868
+billing	0.986	1.5306	0.9868
+
+query T
+SELECT typeof(r.wants_refund) FROM mixed_struct;
+----
+DOUBLE
+
+query ITT
+SELECT question_count, questions->>'$[*].id', questions->>'$[*].type' FROM drex_requests('answers')
+WHERE endpoint = '/v1/systemone' ORDER BY seq;
+----
+3	[category, sentiment, wants_refund]	[choice, score, noul]
+3	[category, sentiment, wants_refund]	[choice, score, noul]
+
+# --- input: VARCHAR is a JSON string state, JSON is a structured state ------------------------------------------------
+
+statement ok
+FROM drex_reset('answers');
+
+query R
+SELECT round(prompt_drex('{"ticket_id": "T-1042", "plan": "enterprise"}'::JSON, 'Is the customer asking for a refund?'), 4);
+----
+0.9868
+
+query R
+SELECT round(prompt_drex('{"ticket_id": "T-1042"}', 'Is the customer asking for a refund?'), 4);
+----
+0.9868
+
+query TT
+SELECT state_type, state FROM drex_requests('answers') WHERE endpoint = '/v1/systemone' ORDER BY seq;
+----
+object	{"ticket_id":"T-1042","plan":"enterprise"}
+string	"{\"ticket_id\": \"T-1042\"}"
+
+# --- one request per non-NULL row; a NULL input sends nothing and returns NULL ---------------------------------------
+
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+CREATE TABLE mixed_rows AS SELECT * FROM (VALUES
+    (1, 'I was charged twice for my March invoice. Please refund one of the charges.'),
+    (2, NULL),
+    (3, 'My login stopped working this morning.')) t(id, body);
+
+query IT
+SELECT id, round(prompt_drex(body, 'Is the customer asking for a refund?'), 4) FROM mixed_rows ORDER BY id;
+----
+1	0.9868
+2	NULL
+3	0.9868
+
+query II
+SELECT count(*), count(DISTINCT body_sha256) FROM drex_requests('answers') WHERE endpoint = '/v1/systemone';
+----
+2	2
+
+# --- headers and the request body, on every request ------------------------------------------------------------------
+
+statement ok
+SELECT prompt_drex(body, 'Is the customer asking for a refund?', model := 'drex-latest') FROM tickets;
+
+query T
+SELECT model FROM drex_requests('answers') WHERE endpoint = '/v1/systemone' ORDER BY seq DESC LIMIT 1;
+----
+drex-latest
+
+# Attribution in User-Agent and X-Nace-Client, the key as a bearer token, JSON, an Idempotency-Key, and a model and
+# instructions string on every question
+query IIIIIIII
+SELECT bool_and(user_agent LIKE 'duckdb-drex/%'), bool_and(x_nace_client = user_agent),
+       bool_and(authorization_header = 'Bearer nace_sk_mockKeyForDrexContractTests_000000000000000'),
+       bool_and(content_type LIKE 'application/json%'), bool_and(coalesce(idempotency_key, '') <> ''),
+       bool_and(model_present), bool_and(instructions_present), bool_and(status = 200)
+FROM drex_requests('answers') WHERE endpoint = '/v1/systemone';
+----
+true	true	true	true	true	true	true	true
+
+# The Idempotency-Key is a hash of the model and the body: the same request gets the same key, another gets another
+statement ok
+FROM drex_reset('answers');
+
+statement ok
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+
+statement ok
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+
+statement ok
+SELECT prompt_drex(body, 'Is the customer asking for a refund?', model := 'drex-max') FROM tickets;
+
+query III
+SELECT count(*), count(DISTINCT idempotency_key), count(DISTINCT body_sha256) FROM drex_requests('answers')
+WHERE endpoint = '/v1/systemone';
+----
+3	2	2

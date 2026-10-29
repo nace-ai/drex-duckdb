@@ -1,0 +1,89 @@
+# name: test/sql/prompt_drex_openrouter.test
+# description: on an openrouter.ai base URL, prompt_drex checks the model against OpenRouter's list and sends its shape
+# group: [sql]
+
+# DuckDB sends every HTTP request through the mock as its proxy, and the mock answers https://openrouter.ai/api/... as
+# OpenRouter would, with a certificate of its own (test/README.md)
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('openrouter');
+
+statement ok
+CREATE TABLE png AS SELECT
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/red.png')) AS red,
+    (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/blue.png')) AS blue;
+
+# The certificate the mock presents for openrouter.ai, which httpfs reads from a local file. GLOBAL, since the
+# extension's requests read the database's settings, not the connection's
+statement ok
+COPY (SELECT content FROM read_text('{DREX_MOCK_URL}/__fixtures/openrouter.pem'))
+TO '__TEST_DIR__/openrouter.pem' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+SET GLOBAL ca_cert_file = '__TEST_DIR__/openrouter.pem';
+
+statement ok
+SET http_proxy = replace('{DREX_MOCK_URL}', 'http://', '');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-mockKeyForDrexContractTests',
+    BASE_URL 'https://openrouter.ai/api/ns/openrouter/ok');
+
+# A model without an owner is Nace's
+query R
+SELECT prompt_drex('text', 'Is it?');
+----
+0.75
+
+query T
+SELECT prompt_drex('text', 'Pick one', choice := ['a', 'b'], model := 'nace-ai/drex-v2.0').choice;
+----
+a
+
+# OpenRouter requires instructions on every question, so a criteria-only noul gets ""
+query R
+SELECT prompt_drex('text', noul := [{'label': 'true', 'description': 'It is'}, {'label': 'false', 'description': NULL}]);
+----
+0.75
+
+# Images go in state content parts, in order
+query TT
+SELECT prompt_drex([red, blue], 'What colour is Image 2?', choice := ['red', 'blue'], model := 'drex-max').choice,
+       prompt_drex([blue, red], 'What colour is Image 2?', choice := ['red', 'blue'], model := 'drex-max').choice
+FROM png;
+----
+blue	red
+
+query TTTIT
+SELECT bool_and(open_router), bool_and(http_referer = 'https://github.com/nace-ai/drex-duckdb'),
+       bool_and(x_openrouter_title = 'Drex for DuckDB'), count(*), list(model ORDER BY seq)
+FROM drex_requests('openrouter') WHERE endpoint = '/v1/systemone' AND status = 200 AND instructions_present;
+----
+true	true	true	5	[nace-ai/drex-v2.0, nace-ai/drex-v2.0, nace-ai/drex-v2.0, nace-ai/drex-max, nace-ai/drex-max]
+
+query TT
+SELECT list(image_colours ORDER BY seq), list(state_type ORDER BY seq) FROM drex_requests('openrouter')
+WHERE endpoint = '/v1/systemone' AND image_count > 0;
+----
+[[red, blue], [blue, red]]	[array, array]
+
+# Whether a model reads images comes from OpenRouter's input_modalities
+statement error
+SELECT prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue']) FROM png;
+----
+<REGEX>:.*prompt_drex: .*drex-v2\.0 does not read images.*
+
+# Only Nace's models on OpenRouter are listed, and drex-max-v1.1 is not one of them
+statement error
+SELECT prompt_drex('text', 'Is it?', model := 'drex-max-v1.1');
+----
+<REGEX>:.*prompt_drex: unknown model 'drex-max-v1\.1'; GET /v1/models lists nace-ai/drex-v1\.5, nace-ai/drex-v2\.0, nace-ai/drex-max.*
+
+statement error
+SELECT prompt_drex('text', 'Is it?', model := 'liquid/d1.1');
+----
+<REGEX>:.*prompt_drex: unknown model 'liquid/d1\.1'.*
+
+statement ok
+RESET http_proxy;

@@ -1,0 +1,157 @@
+# name: test/sql/prompt_drex_errors.test
+# description: 401, 402 and 422 fail the query; 429 and 529 are retried after retry-after-ms with the same request
+# group: [sql]
+
+# Each scenario is a path under the secret's BASE_URL; test/mock/drex_mock.py lists them
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('errors');
+
+statement ok
+CREATE TABLE tickets AS SELECT * FROM (VALUES
+    (1, 'I was charged twice for my March invoice. Please refund one of the charges.')) t(id, body);
+
+# --- 401: the query fails with Drex's message, and never shows the key ----------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/401');
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<REGEX>:.*prompt_drex: .*Invalid API key.*
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<!REGEX>:.*nace_sk_mockKeyForDrexContractTests.*
+
+# --- A TLS failure fails the query at once, saying why: no retry would fix it --------------------------------------
+
+# https:// to the mock's plain HTTP port fails the handshake
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL replace('{DREX_MOCK_URL}', 'http://', 'https://') || '/ns/errors/ok');
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<REGEX>:.*prompt_drex: could not reach Drex over TLS: .*SSL.*
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<!REGEX>:.*attempts.*
+
+# --- 402: the query fails, pointing at Billing ----------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/402');
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<REGEX>:.*prompt_drex: .*(insufficient available funds.*dashboard/billing|dashboard/billing.*insufficient available funds).*
+
+# Not retried
+query I
+SELECT count(*) FROM drex_requests('errors') WHERE scenario = '402' AND endpoint = '/v1/systemone';
+----
+1
+
+# --- 422: the query fails, listing every issue as path: message ------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/422');
+
+statement error
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+<REGEX>:.*prompt_drex: .*questions\.a\.instructions: must be a string.*questions\.a\.instructions: noul needs instructions or criteria.*
+
+query I
+SELECT count(*) FROM drex_requests('errors') WHERE scenario = '422' AND endpoint = '/v1/systemone';
+----
+1
+
+# --- 429: wait retry-after-ms (1000), then send the same request again ------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/429-once');
+
+query R
+SELECT round(prompt_drex(body, 'Is the customer asking for a refund?'), 4) FROM tickets;
+----
+0.9868
+
+query TIIII
+SELECT list(status ORDER BY seq), count(DISTINCT body_sha256), count(DISTINCT idempotency_key),
+       bool_and(coalesce(idempotency_key, '') <> ''), max(waited_ms) >= 1000
+FROM drex_requests('errors') WHERE scenario = '429-once' AND endpoint = '/v1/systemone';
+----
+[429, 200]	1	1	true	true
+
+# --- 529: wait retry-after-ms (2000), then send the same request again ------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/529-once');
+
+query R
+SELECT round(prompt_drex(body, 'Is the customer asking for a refund?'), 4) FROM tickets;
+----
+0.9868
+
+query TIIII
+SELECT list(status ORDER BY seq), count(DISTINCT body_sha256), count(DISTINCT idempotency_key),
+       bool_and(coalesce(idempotency_key, '') <> ''), max(waited_ms) >= 2000
+FROM drex_requests('errors') WHERE scenario = '529-once' AND endpoint = '/v1/systemone';
+----
+[529, 200]	1	1	true	true
+
+# --- out of retries: the row is NULL and the query goes on ------------------------------------------------------------
+
+# At most 5 attempts, each after the retry-after-ms (2000) of the one before, all with the same body and key. About
+# 8 s, well inside the 120 s budget per row
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/529-always');
+
+query T
+SELECT prompt_drex(body, 'Is the customer asking for a refund?') FROM tickets;
+----
+NULL
+
+query TIIII
+SELECT list(attempt ORDER BY seq), count(DISTINCT body_sha256), count(DISTINCT idempotency_key),
+       bool_and(coalesce(idempotency_key, '') <> ''), bool_and(attempt = 1 OR waited_ms >= 2000)
+FROM drex_requests('errors') WHERE scenario = '529-always' AND endpoint = '/v1/systemone';
+----
+[1, 2, 3, 4, 5]	1	1	true	true
+
+# Retries are per row: with two rows, each is refused once and answered on its retry
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/errors/529-once');
+
+statement ok
+FROM drex_reset('errors');
+
+query IR
+SELECT id, round(prompt_drex(body, 'Is the customer asking for a refund?'), 4)
+FROM (VALUES (1, 'First ticket'), (2, 'Second ticket')) t(id, body) ORDER BY id;
+----
+1	0.9868
+2	0.9868
+
+query TI
+SELECT list(status ORDER BY seq), count(DISTINCT body_sha256) FROM drex_requests('errors')
+WHERE scenario = '529-once' AND endpoint = '/v1/systemone' GROUP BY body_sha256 ORDER BY min(seq);
+----
+[529, 200]	1
+[529, 200]	1

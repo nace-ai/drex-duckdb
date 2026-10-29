@@ -1,0 +1,33 @@
+# Included by the mock-backed tests. Skips the including file unless the mock is running (CI's mock job sets
+# DREX_MOCK_URL), and defines:
+# - drex_reset(ns): forgets namespace ns's requests at the mock
+# - drex_requests(ns): the requests the mock received under ns, one row each, oldest first by seq (test/README.md
+#   describes the columns)
+require drex
+
+require httpfs
+
+require json
+
+require-env DREX_MOCK_URL
+
+# Every read of the log must reach the mock
+statement ok
+SET enable_external_file_cache = false;
+
+statement ok
+CREATE MACRO drex_reset(ns) AS TABLE SELECT content FROM read_text('{DREX_MOCK_URL}/__reset/' || ns);
+
+statement ok
+CREATE MACRO drex_requests(ns) AS TABLE
+SELECT * EXCLUDE (questions, body), questions::JSON AS questions, body::JSON AS body
+FROM read_json('{DREX_MOCK_URL}/__log/' || ns, format = 'newline_delimited', columns = {
+    seq: 'BIGINT', open_router: 'BOOLEAN', scenario: 'VARCHAR', method: 'VARCHAR', endpoint: 'VARCHAR',
+    status: 'INTEGER', retry_after_ms: 'INTEGER', authorization_header: 'VARCHAR', user_agent: 'VARCHAR',
+    x_nace_client: 'VARCHAR',
+    idempotency_key: 'VARCHAR', content_type: 'VARCHAR', http_referer: 'VARCHAR', x_openrouter_title: 'VARCHAR',
+    model: 'VARCHAR', model_present: 'BOOLEAN', served_model: 'VARCHAR', state_type: 'VARCHAR', state: 'VARCHAR',
+    question_count: 'INTEGER', instructions_present: 'BOOLEAN', questions: 'VARCHAR', image_count: 'INTEGER',
+    image_colours: 'VARCHAR[]', body_sha256: 'VARCHAR', attempt: 'INTEGER', waited_ms: 'DOUBLE', in_flight: 'INTEGER',
+    received_at: 'DOUBLE', body: 'VARCHAR'})
+WHERE endpoint <> '(log)';

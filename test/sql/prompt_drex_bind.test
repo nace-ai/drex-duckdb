@@ -1,0 +1,149 @@
+# name: test/sql/prompt_drex_bind.test
+# description: what prompt_drex can check from its constant arguments fails at bind time, before any request is sent
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('bind');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/bind/ok');
+
+statement ok
+CREATE TABLE png AS SELECT (SELECT content FROM read_blob('{DREX_MOCK_URL}/__fixtures/red.png')) AS red;
+
+# --- at most 512 questions, on every model ---------------------------------------------------------------------------
+
+# Drex Max included: all models are subject to the 512-question client limit
+statement error
+SELECT prompt_drex('text', questions := ('{' || array_to_string(['"q' || x || '": {"type": "noul", "instructions": "Question ' || x || '?"}'
+                                                   FOR x IN range(1, 514)], ', ') || '}')::JSON,
+                   model := 'drex-max');
+----
+<REGEX>:.*prompt_drex: .*\b512\b.*
+
+# --- images need an image model --------------------------------------------------------------------------------------
+
+# drex-v2.0 is the default model
+statement error
+SELECT prompt_drex(red, 'What colour is Image 1?', choice := ['red', 'blue']) FROM png;
+----
+<REGEX>:.*prompt_drex: .*(drex-v2\.0.*image|image.*drex-v2\.0).*
+
+statement error
+SELECT prompt_drex([red], 'What colour is Image 1?', choice := ['red', 'blue'], model := 'drex-v1.5') FROM png;
+----
+<REGEX>:.*prompt_drex: .*(drex-v1\.5.*image|image.*drex-v1\.5).*
+
+# --- the model must be one GET /v1/models lists ----------------------------------------------------------------------
+
+# Drex itself would answer drex-v99.9 with drex-v2.0 (lib/models.ts), so only the client's check can refuse it
+statement error
+SELECT prompt_drex('text', 'Is it?', model := 'drex-v99.9');
+----
+<REGEX>:.*prompt_drex: .*drex-v99\.9.*
+
+statement error
+SELECT prompt_drex('text', 'Is it?', model := 'jev-latest');
+----
+<REGEX>:.*prompt_drex: .*jev-latest.*
+
+statement error
+SELECT prompt_drex(t, 'Is it?', model := m) FROM (VALUES ('text', 'drex-v2.0')) v(t, m);
+----
+must be a constant
+
+# --- prompt_jev arguments Drex has no question type for --------------------------------------------------------------
+
+statement error
+SELECT prompt_drex('text', 'Which apply?', multiple_choice := ['a', 'b']);
+----
+<REGEX>:.*prompt_drex: .*multiple_choice.*
+
+statement error
+SELECT prompt_drex('text', box := 'the logo');
+----
+<REGEX>:.*prompt_drex: .*box.*
+
+# --- choice and score criteria ---------------------------------------------------------------------------------------
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := ['only']);
+----
+<REGEX>:.*prompt_drex: .*\b2\b.*\b255\b.*
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := [x::VARCHAR FOR x IN range(256)]);
+----
+<REGEX>:.*prompt_drex: .*\b2\b.*\b255\b.*
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := ['same', 'same']);
+----
+<REGEX>:(?i).*prompt_drex: .*(unique|duplicate).*same.*
+
+# Criteria take prompt_jev's two forms, a VARCHAR[] of labels or a STRUCT(label, description)[]; anything else names
+# the argument and the accepted forms (both mention a label)
+statement error
+SELECT prompt_drex('text', 'Is it?', noul := 'yes');
+----
+<REGEX>:.*prompt_drex: .*noul.*label.*
+
+statement error
+SELECT prompt_drex('text', 'Which?', choice := {'billing': 'Payments', 'other': NULL});
+----
+<REGEX>:.*prompt_drex: .*choice.*label.*
+
+# noul's labels are exactly true and false; the message names the labels it found
+statement error
+SELECT prompt_drex('text', 'Is it?', noul := ['yes', 'no']);
+----
+<REGEX>:.*prompt_drex: .*noul.*yes.*
+
+# Drex's score levels are plain strings
+statement error
+SELECT prompt_drex('text', 'How upset?', score := [{'label': 'Calm', 'description': 'No complaint'},
+                                                 {'label': 'Angry', 'description': 'Threatens to leave'}]);
+----
+score levels take no description
+
+# As in prompt_jev, noul, choice, score and questions are mutually exclusive
+statement error
+SELECT prompt_drex('text', 'Which?', choice := ['a', 'b'], score := ['low', 'high']);
+----
+<REGEX>:.*prompt_drex: .*(choice.*score|score.*choice).*
+
+# --- none of the refusals sent a request -----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM drex_requests('bind') WHERE endpoint = '/v1/systemone';
+----
+0
+
+# The unknown models were refused after a successful GET /v1/models, not for want of one
+query I
+SELECT count(*) > 0 AND bool_and(status = 200) FROM drex_requests('bind') WHERE endpoint = '/v1/models';
+----
+true
+
+# --- the limits themselves are accepted ------------------------------------------------------------------------------
+
+# typeof alone is answered from the type at bind time without running prompt_drex, so read the value too
+query IT
+SELECT r.q17 IS NOT NULL, typeof(r.q17) FROM (SELECT prompt_drex('text', questions := ('{' || array_to_string(['"q' || x || '": {"type": "noul", "instructions": "Question ' || x || '?"}'
+                                                                          FOR x IN range(1, 18)], ', ') || '}')::JSON,
+                          model := 'drex-max') AS r);
+----
+true	DOUBLE
+
+query T
+SELECT prompt_drex('text', 'Which?', choice := [x::VARCHAR FOR x IN range(255)]).choice;
+----
+0
+
+query II
+SELECT count(*), bool_and(status = 200) FROM drex_requests('bind') WHERE endpoint = '/v1/systemone';
+----
+2	true

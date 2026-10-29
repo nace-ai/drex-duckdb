@@ -1,0 +1,135 @@
+# name: test/sql/edge_text.test
+# description: unusual text and JSON inputs are sent as written, and a state over the token limit makes its row NULL
+# group: [sql]
+
+include test/mock/requests.test_template
+
+statement ok
+FROM drex_reset('edge_text');
+
+statement ok
+CREATE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_text/ok');
+
+# --- text: a JSON string state, character for character -------------------------------------------------------------
+
+# Drex takes any state, the empty string included, so every row is sent and answered (the mock's noul is 0.75)
+statement ok
+CREATE TABLE texts AS SELECT * FROM (VALUES
+    (1, ''),
+    (2, '   '),
+    (3, chr(9) || chr(10) || chr(13)),
+    (4, '😀 🎉👍🏽 👨‍👩‍👧'),
+    (5, 'مرحبا بالعالم'),
+    (6, 'שלום abc ' || chr(8207) || '123'),
+    (7, 'a' || chr(0) || 'b'),
+    (8, 'say "hi" \ {"not": "json"}')) t(id, body);
+
+query IR
+SELECT id, prompt_drex(body, 'Refund?') FROM texts ORDER BY id;
+----
+1	0.75
+2	0.75
+3	0.75
+4	0.75
+5	0.75
+6	0.75
+7	0.75
+8	0.75
+
+query III
+SELECT count(*), count(*) FILTER (state_type = 'string'), count(t.id)
+FROM drex_requests('edge_text') r LEFT JOIN texts t ON r.state::JSON->>'$' = t.body
+WHERE endpoint = '/v1/systemone';
+----
+8	8	8
+
+# DuckDB's VARCHAR is always valid UTF-8, so invalid UTF-8 can only be a BLOB, which prompt_drex sends as an image
+statement error
+SELECT prompt_drex(decode('\xC3\x28'::BLOB), 'Refund?');
+----
+could not convert blob to UTF8 string
+
+statement error
+SELECT prompt_drex('\xC3\x28'::BLOB, 'Refund?');
+----
+<REGEX>:.*prompt_drex: drex-v2\.0 does not read images.*
+
+# On an image model it is not a PNG, JPEG or WebP, so the row is NULL and nothing is sent (edge_images.test)
+query R
+SELECT prompt_drex('\xC3\x28\xFF'::BLOB, 'Refund?', model := 'drex-max');
+----
+NULL
+
+# --- JSON null is a state; SQL NULL sends nothing ---------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_text');
+
+query RRR
+SELECT prompt_drex('null'::JSON, 'Refund?'), prompt_drex(NULL::JSON, 'Refund?'), prompt_drex('null', 'Refund?');
+----
+0.75	NULL	0.75
+
+query TT
+SELECT drex_decide('null', '{"a": {"type": "noul", "instructions": "Refund?"}}')->>'$.answers.a.noul',
+       drex_decide(NULL, '{"a": {"type": "noul", "instructions": "Refund?"}}');
+----
+0.75	NULL
+
+query TT
+SELECT state_type, state FROM drex_requests('edge_text') WHERE endpoint = '/v1/systemone' ORDER BY seq;
+----
+null	null
+string	"null"
+null	null
+
+# --- deeply nested JSON is sent as written ---------------------------------------------------------------------------
+
+statement ok
+FROM drex_reset('edge_text');
+
+query RR
+SELECT prompt_drex((repeat('{"a":', 300) || '1' || repeat('}', 300))::JSON, 'Refund?'),
+       prompt_drex((repeat('[', 300) || ']' || repeat(',[]]', 299))::JSON, 'Refund?');
+----
+0.75	0.75
+
+query T
+SELECT list(state ORDER BY seq) = [repeat('{"a":', 300) || '1' || repeat('}', 300),
+                                   repeat('[', 300) || ']' || repeat(',[]]', 299)]
+FROM drex_requests('edge_text') WHERE endpoint = '/v1/systemone';
+----
+true
+
+# --- a state right at the token limit, and one token over ------------------------------------------------------------
+
+# The too-long scenario counts 4 bytes of JSON state a token and refuses a state over 1,024 tokens, as Drex does. A text
+# of 4,097 characters is a state of 4,099 bytes, 1,024 tokens; one more character makes 1,025
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_000000000000000',
+    BASE_URL '{DREX_MOCK_URL}/ns/edge_text/too-long');
+
+statement ok
+FROM drex_reset('edge_text');
+
+statement ok
+CALL enable_logging(level = 'warning', storage = 'memory');
+
+query IR
+SELECT n, prompt_drex(repeat('x', n), 'Refund?') FROM (VALUES (4097), (4098)) t(n) ORDER BY n;
+----
+4097	0.75
+4098	NULL
+
+query II
+SELECT count(*), count(*) FILTER (status = 422) FROM drex_requests('edge_text') WHERE endpoint = '/v1/systemone';
+----
+2	1
+
+query T
+SELECT count(*) FROM duckdb_logs
+WHERE log_level = 'WARNING'
+  AND message LIKE 'prompt_drex: a row returned NULL: HTTP 422: state: exceeds the 1,024-token state limit (request req_%)';
+----
+1
