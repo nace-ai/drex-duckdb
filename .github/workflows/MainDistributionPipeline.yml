@@ -25,8 +25,6 @@ jobs:
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
       # Intel Macs are opt-in since ci-tools v2.0; community builds them only when the descriptor opts in
       opt_in_archs: 'osx_amd64'
-      # Builds the vcpkg dependencies (curl, OpenSSL) of httpfs, which the tests load
-      use_merged_vcpkg_manifest: '1'
 
   code-quality-check:
     name: Code Quality Check
