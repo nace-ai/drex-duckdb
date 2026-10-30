@@ -1,8 +1,43 @@
-# Drex for DuckDB
+<p align="center">
+  <a href="https://nace.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/nace-logo-white.svg"><img src="docs/assets/nace-logo-black.svg" alt="Nace" height="40"></picture></a>
+  &nbsp;&nbsp;＋&nbsp;&nbsp;
+  <a href="https://duckdb.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/duckdb-logo-dark.svg"><img src="docs/assets/duckdb-logo-light.svg" alt="DuckDB" height="40"></picture></a>
+</p>
 
-Ask typed questions about your data directly from SQL. `drex` connects DuckDB to
-[Drex](https://console.nace.ai/docs) to classify text, score rows, and return probabilities
-as native SQL values.
+<h1 align="center">Drex for DuckDB</h1>
+
+<p align="center">
+  <b>Ask typed questions about your data, directly from SQL.</b><br>
+  Classify text, score rows, and get probabilities as native DuckDB values, powered by <a href="https://console.nace.ai/docs">Drex</a>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/nace-ai/drex-duckdb/actions/workflows/MainDistributionPipeline.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/nace-ai/drex-duckdb/MainDistributionPipeline.yml?branch=main&amp;label=build&amp;logo=github"></a>
+  <a href="https://github.com/nace-ai/drex-duckdb/actions/workflows/MockContractTests.yml"><img alt="Contract tests" src="https://img.shields.io/github/actions/workflow/status/nace-ai/drex-duckdb/MockContractTests.yml?branch=main&amp;label=contract%20tests&amp;logo=github"></a>
+  <a href="#getting-started"><img alt="DuckDB v2.0.0 source build" src="https://img.shields.io/badge/DuckDB-v2.0.0-fff100?logo=duckdb&amp;logoColor=black"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+</p>
+
+<p align="center">
+  <a href="#getting-started">Getting started</a> ·
+  <a href="#examples">Examples</a> ·
+  <a href="docs/API.md">SQL API</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+---
+
+**Drex** is Nace's family of decision models. This extension brings typed answers to the
+data you already query with DuckDB: support tickets, documents, JSON, and images on
+supported models.
+
+| Ask | Get back | Use it for |
+| --- | --- | --- |
+| **Yes / no** (`noul`) | A `DOUBLE`: the probability of yes | Find refund requests or flag relevant documents |
+| **Pick a label** (`choice`) | A struct with the choice, probabilities, and confidence | Route tickets to the right team |
+| **Score a rubric** (`score`) | A struct with the score, probabilities, and confidence | Rank urgency on an ordered scale |
+| **Several questions** (`questions`) | A struct with one typed field per question | Enrich each row in one decision request |
 
 ```sql
 SELECT prompt_drex(
@@ -11,11 +46,8 @@ SELECT prompt_drex(
 ) AS refund_probability;
 ```
 
-Use it for support-ticket routing, document classification, and scoring data you already
-query with DuckDB. Inputs can be text, JSON, or images on supported models.
-
-[Getting started](#getting-started) · [Examples](#examples) · [API reference](docs/API.md) ·
-[Contributing](CONTRIBUTING.md)
+The example above returns a probability, not generated text. Follow the setup below to
+build the extension and connect your API key.
 
 ## Getting started
 
@@ -24,7 +56,7 @@ the instructions below do not require a community extension release. Extension b
 must match the DuckDB version and platform that load them. This is a local DuckDB
 extension; it does not provide a server-side MotherDuck function or a browser/Wasm build.
 
-### 1. Build
+### 1. Build from source
 
 You need Git, CMake, Make, a C++17 compiler, Python 3.10+, and the OpenSSL and curl development
 libraries. Ninja is optional. The build fetches `httpfs` for HTTPS support.
@@ -52,7 +84,7 @@ brew install cmake ninja openssl@3 curl
 OPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" GEN=ninja make release
 ```
 
-### 2. Load and authenticate
+### 2. Connect to Nace
 
 Get an API key from the [Nace console](https://console.nace.ai). Set `NACE_API_KEY` in
 your environment through your secret manager or a hidden shell prompt before starting
@@ -76,7 +108,7 @@ CREATE SECRET (TYPE nace, PROVIDER env);
 provider reads `NACE_API_KEY` and optional `NACE_BASE_URL` when you create the secret.
 The default endpoint is `https://console.nace.ai`.
 
-### 3. Query
+### 3. Ask your first question
 
 ```sql
 CREATE TABLE tickets AS
@@ -97,6 +129,9 @@ without sending the same rows again.
 
 ## Examples
 
+These examples use the `tickets` table from the getting-started query. The default model
+is `drex-v2.0`; select another available model with `model :=`.
+
 ### Classify a row
 
 ```sql
@@ -110,6 +145,20 @@ FROM tickets;
 
 The result is a struct with `choice`, `probabilities`, and `confidence` fields.
 
+### Score on an ordered scale
+
+```sql
+SELECT id, prompt_drex(
+    body,
+    'How urgent is this ticket?',
+    score := ['low', 'medium', 'high']
+) AS urgency
+FROM tickets;
+```
+
+The result contains `score`, `probabilities`, and `confidence`. Levels are ordered from
+low to high; the score can fall between levels.
+
 ### Ask several questions in one request per row
 
 ```sql
@@ -122,7 +171,27 @@ FROM tickets;
 ```
 
 This returns a struct with `refund` and `urgency` fields. See the [API reference](docs/API.md)
-for return types, model selection, images, and the lower-level `drex_decide` function.
+for complete return types and the lower-level `drex_decide` function.
+
+### Work with JSON and images
+
+Pass `JSON` to send structured data instead of text:
+
+```sql
+SELECT prompt_drex(
+    '{"subject": "Duplicate charge", "message": "Please refund one payment."}'::JSON,
+    'Is the customer asking for a refund?'
+) AS refund_probability;
+```
+
+For an image, use an image-capable model such as `drex-max` and supply your own file:
+
+```sql
+SELECT prompt_drex(content, 'Does this image contain a receipt?', model := 'drex-max')
+FROM read_blob('receipt.png');
+```
+
+PNG, JPEG, and WebP inputs are supported. See [inputs and models](docs/API.md#inputs-and-models).
 
 ## Requests, privacy, and cost
 
@@ -170,4 +239,8 @@ Report bugs and request features through [GitHub Issues](https://github.com/nace
 Include your DuckDB version, platform, and a minimal example with credentials and private data removed.
 
 Maintained by Nace AI. Built from the [DuckDB extension template](https://github.com/duckdb/extension-template).
-Licensed under [MIT](LICENSE).
+
+## License
+
+Code is licensed under [MIT](LICENSE). Nace and DuckDB logos belong to their respective
+owners; see [brand asset sources](docs/assets/README.md).
