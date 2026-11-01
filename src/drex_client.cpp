@@ -45,7 +45,7 @@ static constexpr const char *MAX_RPM_SETTING = "drex_max_rpm";
 //! No limit: Drex answers an account over its own limit with a 429 and retry-after-ms, which the retries wait out
 static constexpr idx_t DEFAULT_MAX_RPM = 0;
 
-static constexpr const char *OPENROUTER_REFERER = "https://github.com/nace-ai/drex-duckdb";
+static constexpr const char *OPENROUTER_REFERER = "https://nace.ai";
 static constexpr const char *OPENROUTER_TITLE = "Drex for DuckDB";
 static constexpr const char *OPENROUTER_BILLING_URL = "https://openrouter.ai/settings/credits";
 
@@ -59,8 +59,7 @@ static string ClientName() {
 	return "drex-duckdb/" + (version.empty() ? string("dev") : version);
 }
 
-//! Whether the base URL is OpenRouter's (https://openrouter.ai/api), which takes a different body and headers
-static bool IsOpenRouter(const string &base_url) {
+bool IsOpenRouter(const string &base_url) {
 	auto host = base_url.substr(base_url.find("://") + 3);
 	host = StringUtil::Lower(host.substr(0, host.find_first_of("/:?#")));
 	return host == "openrouter.ai" || StringUtil::EndsWith(host, ".openrouter.ai");
@@ -460,8 +459,8 @@ static DrexHttpResponse SendOnce(DrexSession &session, const DrexCredentials &cr
 	headers.Insert("User-Agent", client_name);
 	headers.Insert("X-Nace-Client", client_name);
 	if (IsOpenRouter(credentials.base_url)) {
-		headers.Insert("HTTP-Referer", OPENROUTER_REFERER);
-		headers.Insert("X-OpenRouter-Title", OPENROUTER_TITLE);
+		headers.Insert("HTTP-Referer", credentials.referer.empty() ? OPENROUTER_REFERER : credentials.referer);
+		headers.Insert("X-OpenRouter-Title", credentials.title.empty() ? OPENROUTER_TITLE : credentials.title);
 	}
 
 	unique_ptr<HTTPResponse> response;
@@ -805,8 +804,7 @@ shared_ptr<DrexClient> DrexClient::Get(ClientContext &context) {
 	auto state = GetInstanceState(db);
 	lock_guard<mutex> guard(state->client_lock);
 	auto &client = state->client;
-	if (!client || client->credentials.api_key != credentials.api_key ||
-	    client->credentials.base_url != credentials.base_url) {
+	if (!client || !(client->credentials == credentials)) {
 		client = make_shared_ptr<DrexClient>(db, std::move(credentials));
 	}
 	return client;
