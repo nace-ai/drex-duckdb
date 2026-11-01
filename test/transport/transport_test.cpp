@@ -21,6 +21,7 @@ static int failures = 0;
 	} while (0)
 
 static const string KEY = "nace_sk_mockKeyForDrexContractTests_000000000000000";
+static const string OPENROUTER_URL = "https://openrouter.ai/api";
 static string mock;
 
 static unique_ptr<QueryResult> Q(Connection &con, const string &sql) {
@@ -61,7 +62,8 @@ static Value Log(Connection &con, const string &ns, const string &select) {
 	               "', format = 'newline_delimited', columns = {seq: 'BIGINT', scenario: 'VARCHAR', "
 	               "endpoint: 'VARCHAR', status: 'INTEGER', authorization_header: 'VARCHAR', user_agent: "
 	               "'VARCHAR', x_nace_client: 'VARCHAR', idempotency_key: 'VARCHAR', content_type: 'VARCHAR', "
-	               "model: 'VARCHAR', state_type: 'VARCHAR', state: 'VARCHAR', image_colours: 'VARCHAR[]', "
+	               "http_referer: 'VARCHAR', x_openrouter_title: 'VARCHAR', model: 'VARCHAR', state_type: 'VARCHAR', "
+	               "state: 'VARCHAR', image_colours: 'VARCHAR[]', "
 	               "body_sha256: 'VARCHAR', attempt: 'INTEGER', waited_ms: 'DOUBLE'}) WHERE endpoint <> "
 	               "'(log)'");
 	return First(std::move(result));
@@ -121,6 +123,8 @@ int main() {
 		      Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "bool_and(authorization_header = 'Bearer " + KEY + "')") == Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "bool_and(content_type = 'application/json')") == Value::BOOLEAN(true));
+		CHECK(Log(con, "t_ok", "bool_and(http_referer IS NULL AND x_openrouter_title IS NULL)") ==
+		      Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "count(DISTINCT idempotency_key)") == Value::BIGINT(3));
 		CHECK(Log(con, "t_ok", "bool_and(length(idempotency_key) = 64)") == Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "list(state_type ORDER BY state_type)").ToString() == "[object, string, string]");
@@ -128,6 +132,8 @@ int main() {
 
 		// Same body, same key, across calls
 		client->Decide("drex-v2.0", R"("Second ticket")", REFUND, {}, "prompt_drex");
+		CHECK(Log(con, "t_ok", "bool_and(http_referer IS NULL AND x_openrouter_title IS NULL)") ==
+		      Value::BOOLEAN(true));
 		CHECK(Log(con, "t_ok", "count(DISTINCT idempotency_key)") == Value::BIGINT(3));
 
 		auto models = client->Models("prompt_drex");
@@ -270,7 +276,7 @@ int main() {
 			return v.ToString();
 		};
 		CHECK(check("j->>'$.url'") == "https://openrouter.ai/api/v1/systemone");
-		CHECK(check("j->>'$.headers.http-referer'") == "https://github.com/nace-ai/drex-duckdb");
+		CHECK(check("j->>'$.headers.http-referer'") == "https://nace.ai");
 		CHECK(check("j->>'$.headers.x-openrouter-title'") == "Drex for DuckDB");
 		CHECK(check("j->>'$.headers.authorization'") == "Bearer sk-or-v1-test");
 		CHECK(check("j->>'$.body.model'") == "nace-ai/drex-max");
@@ -288,6 +294,68 @@ int main() {
 		result = client->Decide("drex-v2.0", R"("plain")", REFUND, {}, "prompt_drex");
 		CHECK(check("j->>'$.body.state'") == "plain");
 		CHECK(check("j->>'$.body.model'") == "nace-ai/drex-v2.0");
+	}
+
+	std::cout << "OpenRouter: app identity and key isolation" << std::endl;
+	{
+		// Sends one request through the echo proxy and returns the headers it received
+		auto headers_of = [&](const string &secret_sql) {
+			Q(con, secret_sql);
+			auto result = GetClient(con)->Decide("drex-v2.0", R"("plain")", REFUND, {}, "prompt_drex");
+			CHECK(result.Success());
+			return result.json;
+		};
+		// The values of a header the proxy received, joined by |, so that a duplicate shows
+		auto header_values = [&](const string &json, const string &name) {
+			return First(Q(con, "SELECT string_agg(h->>'$[1]', '|') FROM (SELECT unnest(from_json(j->'header_pairs', "
+			                    "'[\"JSON\"]')) AS h FROM (SELECT '" +
+			                        json + "'::JSON AS j)) WHERE h->>'$[0]' = '" + name + "'"))
+			    .ToString();
+		};
+
+		auto defaults = headers_of("CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-test', BASE_URL '" +
+		                           OPENROUTER_URL + "')");
+		CHECK(header_values(defaults, "http-referer") == "https://nace.ai");
+		CHECK(header_values(defaults, "x-openrouter-title") == "Drex for DuckDB");
+
+		auto custom = headers_of("CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-test', BASE_URL '" +
+		                         OPENROUTER_URL + "', REFERER 'https://example.com/app', TITLE 'Example App')");
+		CHECK(header_values(custom, "http-referer") == "https://example.com/app");
+		CHECK(header_values(custom, "x-openrouter-title") == "Example App");
+
+		// A new identity on the same key replaces the cached client's
+		auto replaced = headers_of("CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-test', BASE_URL '" +
+		                           OPENROUTER_URL + "', REFERER 'https://example.org')");
+		CHECK(header_values(replaced, "http-referer") == "https://example.org");
+		CHECK(header_values(replaced, "x-openrouter-title") == "Drex for DuckDB");
+
+		// A nace_ key is refused when the secret is made, so no request can carry it
+		auto refused = con.Query("CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY '" + KEY + "', BASE_URL '" +
+		                         OPENROUTER_URL + "')");
+		CHECK(refused->HasError());
+		CHECK(refused->GetError().find("OPENROUTER_API_KEY") != string::npos);
+
+		// The env provider: OPENROUTER_API_KEY first, then a NACE_API_KEY that is not a nace_ key
+		setenv("NACE_BASE_URL", OPENROUTER_URL.c_str(), 1);
+		auto env_secret = string("CREATE OR REPLACE SECRET drex (TYPE nace, PROVIDER env)");
+		auto authorization = [&](const string &json) {
+			return First(Q(con, "SELECT '" + json + "'::JSON->>'$.headers.authorization'")).ToString();
+		};
+		setenv("OPENROUTER_API_KEY", "sk-or-v1-from-openrouter-env", 1);
+		setenv("NACE_API_KEY", KEY.c_str(), 1);
+		CHECK(authorization(headers_of(env_secret)) == "Bearer sk-or-v1-from-openrouter-env");
+
+		unsetenv("OPENROUTER_API_KEY");
+		setenv("NACE_API_KEY", "sk-or-v1-legacy-in-nace-env", 1);
+		CHECK(authorization(headers_of(env_secret)) == "Bearer sk-or-v1-legacy-in-nace-env");
+
+		setenv("NACE_API_KEY", KEY.c_str(), 1);
+		auto env_refused = con.Query(env_secret);
+		CHECK(env_refused->HasError());
+		CHECK(env_refused->GetError().find("OPENROUTER_API_KEY") != string::npos);
+
+		unsetenv("NACE_API_KEY");
+		unsetenv("NACE_BASE_URL");
 		Q(con, "RESET http_proxy");
 	}
 

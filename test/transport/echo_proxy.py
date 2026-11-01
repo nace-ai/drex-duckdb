@@ -24,7 +24,12 @@ class Echo(OpenRouterTunnel, BaseHTTPRequestHandler):
         # A request through the tunnel names only its path
         url = f"https://{self.tunnel_host}{self.path}" if self.tunnel_host else self.path
         payload = json.dumps(
-            {"url": url, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": json.loads(body)}
+            {
+                "url": url,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "header_pairs": [[k.lower(), v] for k, v in self.headers.items()],
+                "body": json.loads(body),
+            }
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

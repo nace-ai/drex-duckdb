@@ -56,7 +56,7 @@ FROM png;
 blue	red
 
 query TTTIT
-SELECT bool_and(open_router), bool_and(http_referer = 'https://github.com/nace-ai/drex-duckdb'),
+SELECT bool_and(open_router), bool_and(http_referer = 'https://nace.ai'),
        bool_and(x_openrouter_title = 'Drex for DuckDB'), count(*), list(model ORDER BY seq)
 FROM drex_requests('openrouter') WHERE endpoint = '/v1/systemone' AND status = 200 AND instructions_present;
 ----
@@ -67,6 +67,36 @@ SELECT list(image_colours ORDER BY seq), list(state_type ORDER BY seq) FROM drex
 WHERE endpoint = '/v1/systemone' AND image_count > 0;
 ----
 [[red, blue], [blue, red]]	[array, array]
+
+# A secret's REFERER and TITLE replace the defaults
+statement ok
+FROM drex_reset('openrouter_identity');
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-mockKeyForDrexContractTests',
+    BASE_URL 'https://openrouter.ai/api/ns/openrouter_identity/ok', REFERER 'https://example.com/app', TITLE 'Example App');
+
+query R
+SELECT prompt_drex('text', 'Is it?');
+----
+0.75
+
+query TTI
+SELECT http_referer, x_openrouter_title, count(*) FROM drex_requests('openrouter_identity')
+WHERE endpoint = '/v1/systemone' GROUP BY ALL;
+----
+https://example.com/app	Example App	1
+
+# A Nace key is never sent to OpenRouter, whichever provider made the secret
+statement error
+CREATE OR REPLACE SECRET drex_nace_key (TYPE nace, API_KEY 'nace_sk_mockKeyForDrexContractTests_222222222222222',
+    BASE_URL 'https://openrouter.ai/api');
+----
+<REGEX>:.*a nace_ key is never sent to OpenRouter.*OPENROUTER_API_KEY.*
+
+statement ok
+CREATE OR REPLACE SECRET drex (TYPE nace, API_KEY 'sk-or-v1-mockKeyForDrexContractTests',
+    BASE_URL 'https://openrouter.ai/api/ns/openrouter/ok');
 
 # Whether a model reads images comes from OpenRouter's input_modalities
 statement error

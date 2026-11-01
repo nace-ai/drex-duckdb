@@ -69,9 +69,22 @@ the secret after changing either variable. The config provider accepts explicit 
 and optional `BASE_URL` arguments, but putting keys directly in SQL can expose them in
 history and logs. The key is redacted in `duckdb_secrets()`. `SCOPE` is unsupported.
 
-For OpenRouter, set `NACE_BASE_URL=https://openrouter.ai/api` and use an OpenRouter key
-as `NACE_API_KEY`, then recreate the secret. Model availability comes from that endpoint;
-unnamespaced model names are resolved under `nace-ai/`.
+For OpenRouter, set `NACE_BASE_URL=https://openrouter.ai/api` and an OpenRouter key in
+`OPENROUTER_API_KEY`, then recreate the secret. With the config provider, pass the
+OpenRouter key as `API_KEY`. `NACE_API_KEY` is used only when `OPENROUTER_API_KEY` is
+unset and it does not start with `nace_`; a `nace_` key is never sent to OpenRouter, and
+creating the secret fails. Model availability comes from that endpoint; unnamespaced model
+names are resolved under `nace-ai/`.
+
+OpenRouter attributes requests to an app through the `HTTP-Referer` and
+`X-OpenRouter-Title` headers. They default to `https://nace.ai` and `Drex for DuckDB`, and
+only OpenRouter requests carry them. Set your own app identity with the optional `REFERER`
+and `TITLE` arguments, which both providers accept:
+
+```sql
+CREATE OR REPLACE SECRET (TYPE nace, PROVIDER env,
+    REFERER 'https://example.com/app', TITLE 'Example App');
+```
 
 ## Error behavior
 

@@ -13,7 +13,19 @@ struct DrexCredentials {
 	string api_key;
 	//! Scheme and host without a trailing slash, e.g. https://console.nace.ai
 	string base_url;
+	//! The app identity OpenRouter attributes requests to, instead of the defaults; empty keeps them. Sent only to
+	//! OpenRouter
+	string referer;
+	string title;
+
+	bool operator==(const DrexCredentials &other) const {
+		return api_key == other.api_key && base_url == other.base_url && referer == other.referer &&
+		       title == other.title;
+	}
 };
+
+//! Whether the base URL is OpenRouter's (https://openrouter.ai/api), which takes a different body and headers
+bool IsOpenRouter(const string &base_url);
 
 //! The outcome of one request: Drex's response body, or why there is none
 struct DrexResult {
@@ -43,8 +55,8 @@ public:
 	DrexClient(DatabaseInstance &db, DrexCredentials credentials);
 
 	//! The database instance's client for the `nace` secret that applies to the context. It is cached per instance, so
-	//! every thread and query shares its in-flight limit, and replaced when the secret's key or base URL changes.
-	//! Safe to call from several threads at once
+	//! every thread and query shares its in-flight limit, and replaced when the secret's key, base URL or app identity
+	//! changes. Safe to call from several threads at once
 	//! @throws InvalidConfigurationException if there is no `nace` secret
 	static shared_ptr<DrexClient> Get(ClientContext &context);
 
