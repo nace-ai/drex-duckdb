@@ -28,6 +28,8 @@
 
 ---
 
+**Also from Drex:** [Drex Browser Use](https://github.com/nace-ai/drex-browser-harness-pub), an AI browser agent and MCP server. One sentence fills a DoorDash cart in 16 moves.
+
 **Drex** is Nace's family of decision models. This extension brings typed answers to the
 data you already query with DuckDB: support tickets, documents, JSON, and images on
 supported models.
